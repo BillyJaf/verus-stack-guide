@@ -168,6 +168,85 @@ property!{
     }
 }
 ```
-This all hinges on the invariant that we stated in the TSM above, Verus knows that the maps are equal and therefore it know that if we have a `(StackCellAddress, PointsTo<StackCell>)` pair in our `witnesses` map, then there must be an equal pair in the `permissions` map. The only difference is that the `permissions` map houses the exec value.
+This all hinges on the invariant that we stated in the TSM above, Verus knows that the maps are equal and therefore it knows that if we have a `(StackCellAddress, PointsTo<StackCell>)` pair in our `witnesses` map, then there must be an equal pair in the `permissions` map. The only difference is that the `permissions` map houses the exec value. So what else do we need in our TSM?
+
+You might notice that, so far, all of our fields are sharded with map strategies. Since we require both of these maps to be equal, we know that when we want to insert a key-value pair, we must demonstrate the more binding requirement out of the two. i.e. to insert a key `k` into these maps, we must show:
+```rust
+!permissions.dom().contains(k);
+```
+
+But there is one problem with this, since the `permissions` field is sharded with the `storage_map` strategy, attempting to `require` this fact in a transition results in an error. The following is an example transition that reflects how we might try to show that a key is not in the map:
+
+```rust
+transition!{
+    empty_domain(key: StackCellAddress)
+    {
+        require(!pre.permissions.dom().contains(key));
+    }
+}
+
+
+error: A 'storage_map' field cannot be directly referenced here
+   --> ..\stack.rs:XXX:XX
+    |
+XXX |  require(!pre.permissions.dom().contains(key));
+    |  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+```
+
+So, if we can't refer to a `storage_map` field, then how else might we demonstrate that the `permissions` field doesn't contain an address so that we may `deposit` a permission? We need another field!
+
+> **Note:**
+>
+> This is true at the time of writing. The `storage_map` section of the guide specifically notes that: *The deposit instruction has an inherent safety condition that key is not already present in the pre-state. (Note: this is not strictly necessary, and the restriction may be removed later.)*
+>
+> Therefore, this field we are about to include might no longer be necessary in the future, we urge the reader to check the documentation for more details!
+
+How will another field solve our problems? Well, we can have a field with type `set` and shard it with the [variable](https://verus-lang.github.io/verus/state_machines/strategy-variable.html) strategy. Then, we may have an invariant that this set is equal to the domain of our maps. Now, when we want to insert into the maps, we only need to `require` that the key is not within the set - a legal expression! Here is an example of what that field, invariant and transition might look like:
+
+```rust
+type StackCellAddress = usize;
+
+tokenized_state_machine!{
+    machine {
+        fields {
+            #[sharding(variable)]
+            pub addresses: Set<StackCellAddress>,
+
+            #[sharding(persistent_map)]
+            pub witnesses: Map<StackCellAddress, PointsTo<StackCell>>,
+
+            #[sharding(storage_map)]
+            pub permissions: Map<StackCellAddress, PointsTo<StackCell>>,
+        }
+    }
+
+    #[invariant]
+    pub fn witnesses_reflect_permissions_inv(&self) -> bool {
+        self.witnesses == self.permissions
+    }
+
+    #[invariant]
+    pub fn addresses_reflect_permissions_inv(&self) -> bool {
+        self.permissions.dom() == self.addresses
+    }
+
+    transition!{
+        push(permission: PointsTo<StackCell>)
+        {
+            require(!pre.addresses.contains(permission.addr()));
+
+            update addresses = pre.addresses.insert(permission.addr());
+            deposit permissions += [permission.addr() => permission];
+            add witnesses (union)= [permission.addr() => permission];
+
+        }
+    }
+}
+```
+
+
+
+
+
 
 
