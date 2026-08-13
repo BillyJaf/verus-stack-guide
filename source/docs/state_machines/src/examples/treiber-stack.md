@@ -10,7 +10,7 @@ A Treiber Stack, is a stack data structure that permits concurrency through atom
 
 System wide progress is guaranteed; if a thread fails to make progress, it is the direct result of another thread making progress. This is a property that is not seen in Lock-Based algorithms if, for example, a thread is descheduled while holding a mutex. With the formalities out of the way, let's take a look at what operations are present in a Treiber Stack, and how we can implement & verify them!
 
-### Operations:
+## Operations:
 
 The Treiber Stack at its core is still just a stack. As a result, the two main operations that we must support are `push` and `pop`. The stack is made using a linked-list structure where each element maintains a pointer to the one below it in the stack. The actual stack object that we will interact therefore only needs to hold the address of the top element in the stack, and we can `push` and `pop` by updating this top address. In this explanation, I will use the words 'top' & 'head' interchangeably, and also the words 'base' & 'bottom' interchangeably.
 
@@ -71,7 +71,9 @@ So how can we solve this problem?
 
 The solution is actually somewhat trivial, but also undesireable from a performance perspective - we let `StackCell`s leak into the heap. If we never deallocate `StackCell`s, then we can never reuse their memory, and not run into this problem. Of course, as I mentioned, this is not desireable from a performance perspective - but this guide book is more focused on verification rather than performance!
 
-### Implementation:
+## Implementation:
+
+### Tokenised State Machine Fields:
 
 So let's have a go at an implementation and an explanation as to why tokenised state machines are perfect for this data structure.
 
@@ -243,10 +245,172 @@ tokenized_state_machine!{
     }
 }
 ```
+Despite the fact that our program will be multithreaded, it is fine to use a field sharded with the `variable` strategy - you'll see that we will only be interacting with this field through atomics. 
+
+On top of this, it is also required in our TSM to have a field that reflects our real `exec` stack. If this field represents our stack, and we only ever interact with this field through stack operations (push and pop) within transitions, then we can be sure that our implementation is functionally correct.
+
+> **Note:**
+>
+> This is not entirely true, but for the simplicity of the guide it is sufficient. For a more rigorous proof, the user would also have to include a linearised history of events and return a witness token to the user after every operation. The purpose of the witness token is to provide proof to the user that what they thought happend, actually did. It might be confusing, but this witness token is different to the kind we have already been using...
+>
+> Essentially, without a linearised history, the program could technically just do nothing when a `push` or a `pop` is called, and this would satisfy the specifications provided that the intial state is valid. Adding these new witness tokens demonstrates that something has actually occurred, but adding them is too complicated for this guide.
+>
+> Unless you want to be very rigorous, you can forget this ever happened!
+
+So, to add those fields to our TSM, we might include fields like this:
 
 
+```rust
+type StackCellAddress = usize;
 
+#[sharding(variable)]
+pub current_stack_addresses: Seq<StackCellAddress>,
 
+#[sharding(variable)]
+pub popped_addresses: Set<StackCellAddress>,
+```
 
+And have them interact with the field that maintains all addresses that have housed a `StackCell` in our stack like so:
 
+```rust
+type StackCellAddress = usize;
 
+#[sharding(variable)]
+pub current_stack_addresses: Seq<StackCellAddress>,
+
+#[sharding(variable)]
+pub popped_addresses: Set<StackCellAddress>,
+
+#[sharding(variable)]
+pub addresses: Set<StackCellAddress>,
+
+#[invariant]
+pub fn current_stack_union_popped_inv(&self) -> bool {
+    self.current_stack_addresses.to_set().union(self.popped_addresses) == self.addresses
+}
+```
+
+Now is a good time to mention that, in a typical Treiber Stack, you might determine if the stack is empty depending on if the address of the top `StackCell` is `null`. However, we will be using the addresses of `PPtr`s, and there is no way to get a `null` `PPtr`. Fortunately, there is an easy work around - unfortunately, we will need to add another field to our TSM.
+
+We can make use of the `PPtr::<V>::empty()` method, which *allocates heap memory for type `V`, leaving it uninitialized*. Instead of having a `null` address, we can instead store a field in the TSM to represent the base of the stack and initialise it with a `PPtr::<StackCell>::empty()`. Then, whenver we check if the stack is empty, we can instead check if the top address is the base address.
+
+Thats all we need for our TSM `fields`! Of course, we will have to add more invariants, transitions, properties, etc. But it would be good to first show you all the fields we talked about:
+```rust
+type StackCellAddress = usize;
+
+tokenized_state_machine!{
+    machine {
+        fields {
+            // Book Keeping
+
+            #[sharding(constant)]
+            pub base_address: StackCellAddress,
+
+            // Stack Representation
+
+            #[sharding(variable)]
+            pub current_stack_addresses: Seq<StackCellAddress>,
+
+            #[sharding(variable)]
+            pub popped_addresses: Set<StackCellAddress>,
+
+            // Witnesses and Permissions
+
+            #[sharding(variable)]
+            pub addresses: Set<StackCellAddress>,
+
+            #[sharding(persistent_map)]
+            pub witnesses: Map<StackCellAddress, PointsTo<StackCell>>,
+
+            #[sharding(storage_map)]
+            pub permissions: Map<StackCellAddress, PointsTo<StackCell>>,
+        }
+    }    
+}
+```
+
+### Tokenised State Machine Invariants:
+
+Now that we have our fields, let's have a go at writing some invariants that should hold throughout all transitions we write.
+
+> **Note:**
+>
+> This is probably not the best method of developing if you are trying to do something from scratch. For example, while making this stack, I did not first decide what fields would be useful and then the invariants on them. The actual methodology I used was:
+>
+> Have a vague idea of the TSM structure. Implement that structure. Write some invariants. Write some transitions. Everything breaks. Try again.
+>
+> However, for the purpose of the guide, its best to tackle things section by section.
+
+So what invariants do we need on the stack? Well, we already had a few that we discussed earlier:
+
+```rust
+#[invariant]
+pub fn witnesses_reflect_permissions_inv(&self) -> bool {
+    self.witnesses == self.permissions
+}
+
+#[invariant]
+pub fn addresses_reflect_permissions_inv(&self) -> bool {
+    self.permissions.dom() == self.addresses
+}
+
+#[invariant]
+pub fn current_stack_union_popped_inv(&self) -> bool {
+    self.current_stack_addresses.to_set().union(self.popped_addresses) == self.addresses
+}
+```
+
+Remember, our TSM holds a representation the real `exec` stack - our invariants should accomodate this and assert things that uphold this structure. Given this, we can also add the following invariants with very little explanation:
+
+```rust
+// current_stack_addresses: Seq<StackCell>
+// It could technically have duplicate addresses, so we must prohibit this:
+#[invariant]
+pub fn no_duplicates_inv(&self) -> bool {
+    self.current_stack_addresses.no_duplicates()
+}
+
+// As we are not reusing `PPtr`s and instead allowing them to leak, once a
+// StackCell is popped, it can never return to the stack
+#[invariant]
+pub fn current_stack_disjoint_popped_inv(&self) -> bool {
+    self.current_stack_addresses.to_set().disjoint(self.popped_addresses)
+}
+
+// The union of the addresses in our current stack and the set of popped
+// addresses should equal the set of all addresses included in the stack
+#[invariant]
+pub fn current_stack_union_popped_inv(&self) -> bool {
+    self.current_stack_addresses.to_set().union(self.popped_addresses) == self.addresses
+}
+
+// The base address is always present at the base of the stack
+#[invariant]
+pub fn current_stack_contains_base_address_inv(&self) -> bool {
+    &&& self.current_stack_addresses.contains(self.base_address)
+    &&& self.current_stack_addresses.first() == self.base_address
+}
+
+// The base address has a witness - this invariant will become somewhat redundant, 
+// but it doesn't hurt to include it.
+#[invariant]
+pub fn base_address_witness_exists_inv(&self) -> bool {
+    self.witnesses.dom().contains(self.base_address)
+}
+```
+
+Great, we already have a fair few invariants - let's have a think about what else we need to include. Recall that we are using a `storage_map` to keep the `permissions`, and a `persistent_map` to keep the `witnesses`. It was mentioned earlier that the keys in each map can just be the associated address of the value. That is to say:
+
+```rust
+#[invariant]
+pub fn maps_are_correct_inv(&self) -> bool {
+    forall |addr: StackCellAddress| #![auto]
+        (
+            self.witnesses.dom().contains(addr) ==>
+                self.witnesses.index(addr).addr() == addr
+        ) && (
+            self.permissions.dom().contains(addr) ==>
+                self.permissions.index(addr).addr() == addr
+        )
+}
+```
