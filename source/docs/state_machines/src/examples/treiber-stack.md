@@ -397,6 +397,14 @@ pub fn current_stack_contains_base_address_inv(&self) -> bool {
 pub fn base_address_witness_exists_inv(&self) -> bool {
     self.witnesses.dom().contains(self.base_address)
 }
+
+// Everything in our current stack representation has a witness.
+// In other words, if our current stack representation was a set, then it is a subset
+// of the witnesses domain.
+#[invariant]
+pub fn current_stack_has_witnesses_inv(&self) -> bool {
+    self.current_stack_addresses.to_set().subset_of(self.witnesses.dom())
+}
 ```
 
 Great, we already have a fair few invariants - let's have a think about what else we need to include. Recall that we are using a `storage_map` to keep the `permissions`, and a `persistent_map` to keep the `witnesses`. It was mentioned earlier that the keys in each map can just be the associated address of the value. That is to say:
@@ -414,3 +422,77 @@ pub fn maps_are_correct_inv(&self) -> bool {
         )
 }
 ```
+
+Also, remember that we are not using a `null` address to signal that the stack is empty, but instead we are maintaining a specific unitialised `PPtr` with address `base_address`. However, all other permissions in our TSM should be initialised, hence:
+
+```rust
+#[invariant]
+pub fn permissions_are_init_except_base_inv(&self) -> bool {
+    forall |addr: StackCellAddress| #![auto]
+        self.permissions.dom().contains(addr) ==> (
+            addr != self.base_address <==> self.permissions.index(addr).is_init()
+        )
+}
+```
+
+The last invariant we need is what ties it all together. I recommend reading the invariant first and then the explanation - try to see if you can work out what it means and why it might be necessary:
+
+```rust
+#[invariant]
+pub fn witnesses_contains_next_witness_inv(&self) -> bool {
+    forall |addr: StackCellAddress| #![auto]
+        (
+            self.witnesses.dom().contains(addr) &&
+            addr != self.base_address
+        ) ==>
+        self.witnesses.dom().contains(
+            self.witnesses.index(addr).value().next
+        )
+}
+```
+
+Recall that the goal of our invariants is to uphold the stack properties and to store the relevant `PPtr` permissions. We know that a `PointsTo<StackCell>` permission can only be stored in our TSM if the relevant `StackCell` was pushed to the stack. But, a `StackCell` can only be pushed to the stack (excluding the base) if it points to a valid `next` node. i.e. the `next` field is the address of a `PPtr` holding another `StackCell` that was already pushed to the stack. To put it simply: excluding the base, if a `StackCell` is on the top of the stack, then it must point to a previously pushed `StackCell`. Hence, if there is a witness token for a `StackCell`, then there must also be a witness token for the `StackCell` that it points to.
+
+And with that, we have all of the invariants that we need in our TSM - that wasn't so bad, none of the stated invariants should come as a surprise to the reader.
+
+### Tokenised State Machine Transitions & Properties:
+
+Now that we have the invariants, we can write the transitions in our TSM. Starting off with the `init` initialiser that doesn't really need explanation:
+
+```rust
+init!{
+    initialize(base_permission: PointsTo<StackCell>)
+    {
+        require(base_permission.is_uninit());
+
+        init base_address = base_permission.addr();
+        init current_stack_addresses = Seq::empty().push(base_permission.addr());
+        init popped_addresses = Set::empty();
+        init addresses = Set::empty().insert(base_permission.addr());
+        init witnesses = Map::empty().insert(base_permission.addr(), base_permission);
+        init permissions = Map::empty().insert(base_permission.addr(), base_permission);
+    }
+}
+```
+
+Remember, now that we have our invariants, our transitions must satisfy them after finishing. One of our invariants was that the `base_permission` must always be present in our maps, so we pass it as a variable to both `initialize` and the maps. Also, despite `PointsTo<StackCell>` not implementing `Copy` we are free to use it in several places with no compile-time errors. Huh? Remember, the `permissions` is holding the physical permission, `addresses` and `witnesses` are both `Ghost` - they are free to copy even non-copyable variables since they never get compiled anyway, they just assist with the proof. Next, we need to write our most important operations; `push` and `pop`. We'll start with push - again, hopefully nothing should be difficult to comprehend:
+
+```rust
+transition!{
+    push(new_stack_cell_permission: PointsTo<StackCell>)
+    {
+        require(new_stack_cell_permission.is_init());
+        require(pre.current_stack_addresses.last() == new_stack_cell_permission.value().next);
+        require(!pre.addresses.contains(new_stack_cell_permission.addr()));
+
+        update addresses = pre.addresses.insert(new_stack_cell_permission.addr());
+        update current_stack_addresses = pre.current_stack_addresses.push(new_stack_cell_permission.addr());
+        deposit permissions += [new_stack_cell_permission.addr() => new_stack_cell_permission];
+        add witnesses (union)= [new_stack_cell_permission.addr() => new_stack_cell_permission];
+    }
+}
+```
+
+From the perspective of our TSM, pushing to the stack just means depositing a permission. This permission should be initialised, have a `next` value that points to the last address in our stack representation, and should not have already been pushed to the stack. Once we have met these criteria, we update the relevant fields: add the address to the set of all addresses, pushthe address to the end of the stack representation, deposit the permission and add a witness. The `push` transition is relatively simple - we basically just add the permission to the TSM - now let's have a look at `pop`.
+
+
