@@ -16,7 +16,7 @@ The Treiber Stack at its core is still just a stack. As a result, the two main o
 
 Consider the following basic setup for this stack that stores `u32` elements:
 ```rust
-pub struct Stack {
+pub struct TreiberStack {
     pub top_addr: AtomicUsize,
 }
 
@@ -530,3 +530,84 @@ Second, regarding the stack representation `current_stack_addresses`, the TSM ho
 With all of this in mind, lets take a look at the actual implementation.
 
 ### Implementation:
+
+We already have our foundation of what we will use:
+
+```rust
+use std::sync::atomic::AtomicUsize;
+
+pub struct TreiberStack {
+    pub top_addr: AtomicUsize,
+}
+
+pub struct StackCell {
+    pub elem: u32,
+    pub next_addr: usize,
+}
+```
+
+But I just mentioned that there is no relation from this implementation and our state machine. So how can we tie these together? Well, we can make use of Verus' [AtomicUsize](https://verus-lang.github.io/verus/verusdoc/vstd/atomic_ghost/struct.AtomicUsize.html) and [struct_with_invariants](https://verus-lang.github.io/verus/verusdoc/vstd/pervasive/macro.struct_with_invariants.html) macro! So how do these work?
+
+// TODO
+
+Great, now that we understand that, we can update our struct to include the fields that we will need and a skeleteon well-formedness condition.
+
+```rust
+pub struct AtomicTokens {
+    pub current_stack_addresses: Tracked<machine::current_stack_addresses>,
+    pub popped_addresses: Tracked<machine::popped_addresses>,
+    pub witnesses: Tracked<Map<StackCellAddress, machine::witnesses>>,
+    pub addresses: Tracked<machine::addresses>,
+}
+
+struct_with_invariants!{
+    pub struct TreiberStack {
+        pub base_address: StackCellAddress,
+        pub top_addr: AtomicUsize<_, AtomicTokens, _>,
+        pub instance: Tracked<machine::Instance>,
+    }
+
+    pub open spec fn wf(self) -> bool {
+        true
+    }
+}
+```
+
+You'll first notice that our aptly named `AtomicTokens` struct has four fields - one for each field in our TSM that creates a token. That's right, we'll be keeping atleast a subset of all tokens created from the TSM in our `AtomicUsize`. As explained above, this will be the connection from our TSM to our physical code; TSM tokens are stored in the `AtomicUsize`, and the `AtomicUsize` will have invariants that relate the values of these tokens to the value of `top_addr` for correctness.
+
+> **Note:**
+>
+> You'll also notice that we are storing a `Map<StackCellAddress, machine::witnesses>`, whereas all the other tokens are stored without extra structure. If you recall, the `witnesses` field is sharded as a `persistent_map` and, as a result, tokens exist for every key-value pair rather than the field as a whole. Hence, since we are storing a collection of these tokens, we need a set-like structure that can store our collection; a `Map` works best. One key-value pair in this map may look like: `(address, (address, permission))`. Is this clunky? Yes. Do I hate it? Also, yes. But does it work. Yes.
+
+Secondly, you'll notice that our well-formedness condition is always true. So what should we include - what does it mean for our stack to be well-formed? Interestingly, we don't actually have a holistic view of the stack even here, we only have a view of the `top_addr`. Of course, we have our stack representation token `current_stack_addresses`, but we do not have a full view of the entire physical stack. We can start with a few basic checks, for example the `base_address` stored in our struct should equal the `base_address` in our TSM. Further, all tokens stored in our struct should actually be from the correct TSM instance:
+
+```rust
+pub open spec fn wf(self) -> bool {
+    invariant on top_addr with (base_address, instance) is (top_addr: usize, atomic_tokens: AtomicTokens) {
+        // The base address must reflect the TSM base address:
+        &&& base_address == instance.base_address()
+
+        // All tokens must come from the correct TSM:
+        &&& atomic_tokens.current_stack_addresses.instance_id() == instance.id()
+        &&& atomic_tokens.popped_addresses.instance_id() == instance.id()
+        &&& atomic_tokens.addresses.instance_id() == instance.id()
+        &&& forall |addr: StackCellAddress| #![auto]
+                atomic_tokens.witnesses.dom().contains(addr) ==>
+                    atomic_tokens.witnesses.index(addr).instance_id() == instance.id()
+    }
+}
+```
+
+Also, we can assert that our `Map` structure storing the `witness` tokens is setup correctly. i.e. the key of each key-value pair is equal to the key of the value (yes, that is confusing, but its not too bad to read):
+
+```rust
+// Each individual map entry must agree internally at the address it is referencing (map structure):
+forall |addr: StackCellAddress| #![auto]
+    atomic_tokens.witnesses.dom().contains(addr) ==> (
+        atomic_tokens.witnesses.index(addr).key() == addr &&
+        atomic_tokens.witnesses.index(addr).value().addr() == addr
+    )
+```
+
+We also
+
