@@ -517,7 +517,16 @@ transition!{
 
 Wow, it's even easier! Since we are allowing `PPtr<StackCell>`s to live permanently, we never need to remove `witnesses` or `permissions`. To pop, we require that the address we are popping is not the `base_address` and that the permission is the last element in our stack representation. Once we know this, we proceed: we assert that permission actually came from the `witnesses` map, we add the address of the permission to the `popped_addresses` set and remove the last element from the stack representation.
 
-And those are all the transitions we need. We will need a handful of properties, but those will only make sense in the context of future problems we run into. With that, it's time to take a look at the actual implementation.
+And those are all the transitions we need. We will need a handful of properties, but those will only make sense in the context of future problems we run into.
+
+#### Tokenized State Machine Purpose:
+
+So what does the tokenised state machine actually buy us? Well, there are two key parts of the state machine that we have created; the `StackCell` permission storage, and the stack representation.
+
+First, regarding the permissions, the TSM holds the permissions for all `StackCell`s that have ever been pushed to the stack. It is important to note, both the TSM - and therefore the permissions that it holds - are erased at compile time. Irrespective of this fact, we still use the TSM to store our permissions when we `push` to the stack, and hence we retrieve references to `PointsTo<StackCell>` permissions from the TSM when we `pop`.
+
+Second, regarding the stack representation `current_stack_addresses`, the TSM holds a `Seq<StackCellAddress>` that represents the physical stack. However, the TSM alone does not relate it's representation to the physical stack, that is something that we will have to do ourselves. The stack representation is only interacted with via the `push` and `pop` transitions, which are correct stack operations trivially. Hence, if we are able to relate `current_stack_addresses` to our physical stack, and the `push` and `pop` transitions with our physical functions, then our stack is correct.
+
+With all of this in mind, lets take a look at the actual implementation.
 
 ### Implementation:
-
