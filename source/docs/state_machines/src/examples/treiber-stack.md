@@ -807,7 +807,34 @@ pub fn new() -> (treiber_stack: Self)
 }
 ```
 
-We can start by initialising the TSM. But before we do so, recall that `initialize` requires a permission for the `base_address` and also a map 
+We can start by initialising the TSM. But before we do so, recall that `initialize` requires a permission for the `base_address`. On top of this, the initialisation of a `storage_map` also requires an input of type `Map<K, Tok>`. In our case, since `initialize` inserts the `base_address` and permission in to the map, we must pass in a map that has this inserted. Hence, our `new` method now starts like so:
+
+```rust
+pub fn new() -> (treiber_stack: Self)
+    ensures
+        treiber_stack.wf()
+{
+    let (base, Tracked(base_perm)) = PPtr::<StackCell>::empty();
+    let base_address = base.addr();
+
+    let tracked permissions = Map::tracked_empty();
+    proof {
+        permissions.tracked_insert(base_address, base_perm);
+    }
+
+    let tracked (
+        Tracked(instance),
+        Tracked(current_stack_addresses),
+        Tracked(popped_addresses),
+        Tracked(addresses),
+        Tracked(witnesses),
+    ) = machine::Instance::initialize(base_perm, permissions);
+
+    // TODO
+}
+```
+
+Now, all that's left to do is construct our struct of `AtomicTokens`, initialise the `AtomicUsize` and return a `TreiberStack` constructed from these. Combining these, we get:
 
 ```rust
 pub fn new() -> (treiber_stack: Self)
@@ -850,3 +877,11 @@ pub fn new() -> (treiber_stack: Self)
     TreiberStack { base_address, top_address, instance: Tracked(instance) }
 }
 ```
+
+Remember, we need the `base_address` and TSM `instance` as constants, so we pass them as a `(base_address, Tracked(instance))` to the `AtomicUsize`. We also initialise it with `base_address` as the starting physical `usize` and the `atomic_tokens` struct that will hold tokens from our TSM.
+
+And with that, we have arrived at where most of you likely thought we would start; writing `push` and `pop` operations.
+
+### Push:
+
+### Pop
