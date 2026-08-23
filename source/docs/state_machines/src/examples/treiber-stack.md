@@ -546,11 +546,138 @@ pub struct StackCell {
 }
 ```
 
-But I just mentioned that there is no relation from this implementation and our state machine. So how can we tie these together? Well, we can make use of Verus' [AtomicUsize](https://verus-lang.github.io/verus/verusdoc/vstd/atomic_ghost/struct.AtomicUsize.html) and [struct_with_invariants](https://verus-lang.github.io/verus/verusdoc/vstd/pervasive/macro.struct_with_invariants.html) macro! So how do these work?
+But I just mentioned that there is no relation from this implementation and our state machine. So how can we tie these together? Well, we can make use of Verus' [AtomicUsize](https://verus-lang.github.io/verus/verusdoc/vstd/atomic_ghost/struct.AtomicUsize.html) and [struct_with_invariants](https://verus-lang.github.io/verus/verusdoc/vstd/pervasive/macro.struct_with_invariants.html) macro! So how do these work? We can start by having a look at the `AtomicUsize` type definition and `new` method:
 
-// TODO
+```rust
+impl<K, G, Pred> AtomicUsize<K, G, Pred> {
 
-Great, now that we understand that, we can update our struct to include the fields that we will need and a skeleteon well-formedness condition.
+    pub const exec fn new(
+        Ghost(k): Ghost<K>,
+        u: usize,
+        Tracked(g): Tracked<G>,
+    ) -> t : Self
+        requires Pred::atomic_inv(k, u, g),
+        ensures t.well_formed() && t.constant() == k
+}
+```
+
+So what is going on here? First, there are three type parameters `K`, `G` and `Pred` and interestingly none of these are the actual `usize` that we store in the atomic. Taking a look at the `new` method, we can fill in some blanks: `K` is some kind of `Ghost` state and `G` is some kind of `Tracked` state. Then, in the `requires` clause, we can see that `Pred` implements `atomic_inv` which holds an invariant on this state as well as the actual `u: usize`. Now, jumping to the `struct_with_invariants!` macro, it states: *The struct_with_invariants! macro is used at the item level, and it should contains a single struct declaration followed by a single declaration of a spec function returning bool. However, this spec function should not contain a boolean predicate as usual, but instead a series of invariant declarations.* Then later: *A field of the struct, if it uses a supported type, may leave the type incomplete by omitting some of its type parameters*. 
+
+Essentially, we may define our `AtomicUsize` to have type parameters `AtomicUsize<_, G, _>` where `G` type of the `Tracked` token/collection of tokens from the above definition. Then, we define our predicate inside the `struct_with_invariants!` (for our case we will call it `wf` and refer to it as 'well-formed') and this will serve as the invariant that relates the physical `usize` our atomic holds and the `Tracked` tokens. But wait, what about the last argument, what does the `Ghost<K>` do? This serves as a ghost constant that we may also use in our well-formedness invariant. It is useful in proofs to have state that is constant to serve as 'anchors'. For example, we have one `base_address` that we create when we initialise the stack, without some constant state we would have no way to assert that this in unchanged. Also, it is useful to assert that all of the tokens that we hold are not only from the same TSM in the instant, but also from the same TSM that we have been using the whole time. Inside the struct, we are free to include other fields that are not referenced by the invariant, but we may also define several fields that relate to our constant `Ghost<K>`. To give you a small example, consider the following:
+
+```rust
+struct_with_invariants!{
+    pub struct NumberHolder {
+        pub number: u32,
+        pub atomic_size: AtomicUsize<_, (), _>,
+    }
+
+    pub open spec fn wf(self) -> bool {
+        invariant on atomic_size with (number) is (size: usize, nothing: ()) {
+            true
+        }
+    }
+}
+```
+
+In the above example, we've define a struct `NumberHolder` and a related well-formedness condition inside the `struct_with_invariants!` macro. You'll notice that invariant is on the `atomic_size` field of the struct, but we also want to use the `number` field as well, so we include it in the `with` clause. The `is` clause contains the unpacked exec `usize` and also the `Tracked` state (for this example, we aren't tracking anything, so we can use unit). Also, you'll notice that the invariant simply returns `true` and so it should always pass. Let's give it a go:
+
+```rust
+pub fn main() {
+    let ghost_k: Ghost<u32> = Ghost(5);
+    let size: usize = 0;
+    let tracked_g: Tracked<()> = Tracked(());
+
+    let atomic_size = AtomicUsize::new(
+        ghost_k,
+        size,
+        tracked_g,
+    );
+
+    let number_holder = NumberHolder { number: 6, atomic_size };
+    assert(number_holder.wf());
+}
+```
+
+Everything looks good, this should pass right? Let's try verifying it:
+
+```rust
+error: assertion failed
+  --> ..\small_invariant_test.rs:XX:XX
+   |
+XX |     assert(number_holder.wf());
+   |            ^^^^^^^^^^^^^^^^^^ assertion failed
+```
+
+That's strange, our well-formedness condition should always hold, so why is it failing? Notice that we defined the `AtomicUsize` to have a ghost constant `K: u32` with value `5` at construction. Then, when we later instantiated `number_holder`, we defined `number_holder.number = 6`. You might think this to be fine because we made no assertions about the `number` field in our invariant `NumberHolder::wf` - but we didn't have to, this is one of Verus' hidden proof obligations.
+
+When we construct the `AtomicUsize` with this constant ghost state `Ghost(5)`, the `struct_with_invariants!` requires a field in the struct that 'mirrors' this constant. That is why, in the above example, we had to include the `number` field in the well-formedness condition regardless of the fact that we did not use it. i.e. the following does not compile:
+
+```rust
+struct_with_invariants!{
+    pub struct NumberHolder {
+        pub number: u32,
+        pub atomic_size: AtomicUsize<_, (), _>,
+    }
+
+    pub open spec fn wf(self) -> bool {
+        invariant on atomic_size with () is (size: usize, nothing: ()) {
+            true
+        }
+    }
+}
+
+pub fn main() {
+    let ghost_k: Ghost<u32> = Ghost(5);
+    let size: usize = 0;
+    let tracked_g: Tracked<()> = Tracked(());
+
+    let atomic_size = AtomicUsize::new(
+        ghost_k,
+        size,
+        tracked_g,
+    );
+
+    let number_holder = NumberHolder { number: 6, atomic_size };
+}
+```
+
+Attemping to compile gives the following error:
+
+```rust
+  --> ..\small_invariant_test.rs:XX:XX
+   |
+XX |     let number_holder = NumberHolder { number: 6, atomic_size };
+   |                                                   ^^^^^^^^^^^ expected `AtomicUsize<(), (), ...>`, found `AtomicUsize<u32, (), _>`
+   |
+```
+
+I.e. Verus determines the type parameters of the `AtomicUsize` based on what is included in the the invariant's `with` and `is` clauses:
+```rust
+invariant on atomic_size with (number) is (size: usize, nothing: ())
+```
+Ok, we know that, but that still doesn't explain why the `number_holder.wf()` is failing. Well, as I mentioned above, the `struct_with_invariants!` requires a field in the struct that 'mirrors' each constant included when the atomic is created. Then, Verus checks that each 'constant-mirroring' field in the struct equals the constant that was passed in when the Atomic was created without us needing to check this in `wf`. In fact, we don't even have the option; Verus does not expose a method to read these constant values inside of the invariant, Verus just checks that they are equal and then you are free to use your struct-defined-fields instead. Essentially, you create your atomic with some constant ghost state and then whenever you check if your struct is well-formed, Verus checks if your fields equal the state defined at initialisation. You are free to mutate your fields however you like, as long as they return to the constant values before you call a `wf` again! With this in mind, we can fix our above example, like so:
+
+```rust
+pub fn main() {
+    let ghost_k: Ghost<u32> = Ghost(5);
+    let size: usize = 0;
+    let tracked_g: Tracked<()> = Tracked(());
+
+    let atomic_size = AtomicUsize::new(
+        ghost_k,
+        size,
+        tracked_g,
+    );
+
+    let number_holder = NumberHolder { number: 5, atomic_size };
+    assert(number_holder.wf()) // Passes
+}
+```
+
+Great, now that we understand how that works, let's think about what we want to include in our `AtomicUsize`. Starting with the constant ghost state, I mentioned above that we want to keep track of the TSM instance to be sure that all of our tokens are from the correct TSM, and we also want to keep track of the base address.
+
+Moving on to the `Tracked` but mutable state, what we want to keep here should hopefully be clear to the reader: the tokens from our TSM. Remember, this `AtomicUsize` facilitates the relation between the TSM and our physical address, hence, we may store a struct that holds multiple tokens from our TSM. Given this, we may update our previous struct and write a skeleton well-formedness condition: 
 
 ```rust
 pub struct AtomicTokens {
@@ -568,37 +695,36 @@ struct_with_invariants!{
     }
 
     pub open spec fn wf(self) -> bool {
-        true
+        invariant on top_addr with (base_address, instance) is (top_addr: usize, atomic_tokens: AtomicTokens) {
+            true
+        }
     }
 }
 ```
 
-You'll first notice that our aptly named `AtomicTokens` struct has four fields - one for each field in our TSM that creates a token. That's right, we'll be keeping atleast a subset of all tokens created from the TSM in our `AtomicUsize`. As explained above, this will be the connection from our TSM to our physical code; TSM tokens are stored in the `AtomicUsize`, and the `AtomicUsize` will have invariants that relate the values of these tokens to the value of `top_addr` for correctness.
+First, you'll notice that our aptly named `AtomicTokens` struct has four fields - one for each field in our TSM that creates a token. As explained above, this will be the connection from our TSM to our physical code, so we need an entry for each field of the TSM that creates tokens.
 
 > **Note:**
 >
 > You'll also notice that we are storing a `Map<StackCellAddress, machine::witnesses>`, whereas all the other tokens are stored without extra structure. If you recall, the `witnesses` field is sharded as a `persistent_map` and, as a result, tokens exist for every key-value pair rather than the field as a whole. Hence, since we are storing a collection of these tokens, we need a set-like structure that can store our collection; a `Map` works best. One key-value pair in this map may look like: `(address, (address, permission))`. Is this clunky? Yes. Do I hate it? Also, yes. But does it work. Yes.
 
-Secondly, you'll notice that our well-formedness condition is always true. So what should we include - what does it mean for our stack to be well-formed? Interestingly, we don't actually have a holistic view of the stack even here, we only have a view of the `top_addr`. Of course, we have our stack representation token `current_stack_addresses`, but we do not have a full view of the entire physical stack. We can start with a few basic checks, for example the `base_address` stored in our struct should equal the `base_address` in our TSM. Further, all tokens stored in our struct should actually be from the correct TSM instance:
+Secondly, you'll notice that our well-formedness condition is always true and would only fail if the `base_address` or `instance` has changed. So what should we include - what does it mean for our stack to be well-formed? Interestingly, we don't actually have a holistic view of the stack even here, we only have a view of the `top_addr`. Of course, we have our stack representation token `current_stack_addresses`, but we do not have a full view of the entire physical stack. We can start with a few basic checks, for example the `base_address` stored in our struct should equal the `base_address` from our TSM. Further, all tokens stored in our struct should actually be from the correct TSM instance:
 
 ```rust
-pub open spec fn wf(self) -> bool {
-    invariant on top_addr with (base_address, instance) is (top_addr: usize, atomic_tokens: AtomicTokens) {
-        // The base address must reflect the TSM base address:
-        &&& base_address == instance.base_address()
+// The base address must reflect the TSM base address:
+&&& base_address == instance.base_address()
 
-        // All tokens must come from the correct TSM:
-        &&& atomic_tokens.current_stack_addresses.instance_id() == instance.id()
-        &&& atomic_tokens.popped_addresses.instance_id() == instance.id()
-        &&& atomic_tokens.addresses.instance_id() == instance.id()
-        &&& forall |addr: StackCellAddress| #![auto]
-                atomic_tokens.witnesses.dom().contains(addr) ==>
-                    atomic_tokens.witnesses.index(addr).instance_id() == instance.id()
-    }
-}
+// All tokens must come from the correct TSM:
+&&& atomic_tokens.current_stack_addresses.instance_id() == instance.id()
+&&& atomic_tokens.popped_addresses.instance_id() == instance.id()
+&&& atomic_tokens.addresses.instance_id() == instance.id()
+&&& forall |addr: StackCellAddress| #![auto]
+        atomic_tokens.witnesses.dom().contains(addr) ==>
+            atomic_tokens.witnesses.index(addr).instance_id() == instance.id()
 ```
+You might think that the `base_address == instance.base_address()` check is unnecessary - after all, Verus will check if `base_address` differs from the value we use to initialise the `AtomicUsize`, surely we don't need this check as long as it is true at initialisation. This is correct, however Verus will only make the assertion that `base_address` has not changed and that `instance` has not changed. Any relation between the pair of values must be instantiated again if you want to use it in your proofs. 
 
-Also, we can assert that our `Map` structure storing the `witness` tokens is setup correctly. i.e. the key of each key-value pair is equal to the key of the value (yes, that is confusing, but its not too bad to read):
+We can also assert that our `Map` structure storing the `witness` tokens is setup correctly. i.e. the key of each key-value pair is equal to the key of the value (yes, that is confusing, but its not too bad to read):
 
 ```rust
 // Each individual map entry must agree internally at the address it is referencing (map structure):
