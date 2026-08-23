@@ -17,55 +17,55 @@ The Treiber Stack at its core is still just a stack. As a result, the two main o
 Consider the following basic setup for this stack that stores `u32` elements:
 ```rust
 pub struct TreiberStack {
-    pub top_addr: AtomicUsize,
+    pub top_address: AtomicUsize,
 }
 
 pub struct StackCell {
     pub elem: u32,
-    pub next_addr: usize,
+    pub next_address: usize,
 }
 ```
 
 The following is an overview of how `push(x)` works:
- 1. Atomically load the address of the top element - `top_addr`.
- 2. Construct a new `StackCell` with `elem = x` and `next_addr = top_addr`.
- 3. Compare the address of the stack's current `top_addr` with the previously loaded `top_addr`.
- 4. If the address has not changed, then no other thread has changed the stack - atomically set the stacks `top_addr` to the address of your newly constructed `StackCell` and return.
- 5. If the stack's `top_addr` has changed, then another thread has changed the stack. Repeat from step 1.
+ 1. Atomically load the address of the top element - `top_address`.
+ 2. Construct a new `StackCell` with `elem = x` and `next_address = top_address`.
+ 3. Compare the address of the stack's current `top_address` with the previously loaded `top_address`.
+ 4. If the address has not changed, then no other thread has changed the stack - atomically set the stacks `top_address` to the address of your newly constructed `StackCell` and return.
+ 5. If the stack's `top_address` has changed, then another thread has changed the stack. Repeat from step 1.
 
 The following is an overview of how `pop` works:
- 1. Atomically load the address of the top element - `top_addr`.
- 2. If `top_addr` is `null`, then there is nothing to pop; return.
- 3. Otherwise, there is an element to pop. Cast the address to a stack cell pointer `*const StackCell` and derefence it to obtain the `elem` and `next_addr`.
- 4. Compare the address of the stack's current `top_addr` with the previously loaded `top_addr`.
- 5. If the address has not changed, then no other thread has changed the stack - atomically set the stacks `top_addr` to the address you previously obtained, `next_addr`, and return the popped element `elem`.
- 6. If the stack's `top_addr` has changed, then another thread has changed the stack. Repeat from step 1.
+ 1. Atomically load the address of the top element - `top_address`.
+ 2. If `top_address` is `null`, then there is nothing to pop; return.
+ 3. Otherwise, there is an element to pop. Cast the address to a stack cell pointer `*const StackCell` and derefence it to obtain the `elem` and `next_address`.
+ 4. Compare the address of the stack's current `top_address` with the previously loaded `top_address`.
+ 5. If the address has not changed, then no other thread has changed the stack - atomically set the stacks `top_address` to the address you previously obtained, `next_address`, and return the popped element `elem`.
+ 6. If the stack's `top_address` has changed, then another thread has changed the stack. Repeat from step 1.
 
 ### The ABA Problem:
 
 Those with a keen eye might have noticed a problem with the above algorithm known as the [ABA problem](https://en.wikipedia.org/wiki/ABA_problem). The crux of the problem is as follows: we assume that the stack has not been interacted with by comparing addresses, but there is nothing stopping everything underneath this address from changing. To illustrate this point, consider the following stack:
 
 ```rust
-top_addr = A
-*(A as *const StackCell).next_addr = B
-*(B as *const StackCell).next_addr = C
+top_address = A
+*(A as *const StackCell).next_address = B
+*(B as *const StackCell).next_address = C
 ```
 
-Imagine that there are two threads, `T1` and `T2` interacting with the stack. The first thread `T1` beings a `pop` operation: it loads the `top_addr = A` and dereferences it as a `StackCell` to get the `next_addr = B`. Before it continues, it is preempted and the second thread `T2` begins execution. `T2` successfully pops the top two elements from the stack so that it then it only consists of:
+Imagine that there are two threads, `T1` and `T2` interacting with the stack. The first thread `T1` beings a `pop` operation: it loads the `top_address = A` and dereferences it as a `StackCell` to get the `next_address = B`. Before it continues, it is preempted and the second thread `T2` begins execution. `T2` successfully pops the top two elements from the stack so that it then it only consists of:
 ```
-top_addr = C
+top_address = C
 ```
 We free the memory that is associated with `A` and `B` as they have been popped. `T2` then pushes a new element to the stack, however, because we have freed `A` & `B`'s memory, the new `StackCell` gets created at address `A`. The push proceeds and we get:
 ```rust
-top_addr = A
-*(A as *const StackCell).next_addr = C
+top_address = A
+*(A as *const StackCell).next_address = C
 ```
-`T2` returns and allows `T1` to continue execution. But look at what has happened! `T1` compares the address it previously loaded, `A`, with the current `top_addr`, which is also A - it's a match. `T1` assumes that there has been no change and atomically set the stacks `top_addr` to the address it previously obtained, `B`. This is a huge problem, `B` is no longer a valid address! The stack now looks something like this:
+`T2` returns and allows `T1` to continue execution. But look at what has happened! `T1` compares the address it previously loaded, `A`, with the current `top_address`, which is also A - it's a match. `T1` assumes that there has been no change and atomically set the stacks `top_address` to the address it previously obtained, `B`. This is a huge problem, `B` is no longer a valid address! The stack now looks something like this:
 ```rust
-top_addr = B
-*(B as *const StackCell).next_addr = ??? // Undefined behaviour as B is deallocated
+top_address = B
+*(B as *const StackCell).next_address = ??? // Undefined behaviour as B is deallocated
 ```
-It is clear from this that our stack is now disjoint. `C`, and anything that was in the stack below `C`, is now 'lost' - the `top_addr` of the stack no longer points to a valid `StackCell`.
+It is clear from this that our stack is now disjoint. `C`, and anything that was in the stack below `C`, is now 'lost' - the `top_address` of the stack no longer points to a valid `StackCell`.
 
 So how can we solve this problem?
 
@@ -80,7 +80,7 @@ So let's have a go at an implementation and an explanation as to why tokenized s
 Firstly, looking at the above pseudo-code, you'll notice that there are several times where we did something like this while popping elements:
 ```rust
 *(A as *const StackCell).elem
-*(A as *const StackCell).next_addr
+*(A as *const StackCell).next_address
 ```
 You might notice that this is `unsafe`, and as a result this dereference must occur within an `unsafe` block within normal Rust - not good! Luckily, Verus has the perfect tool for bypassing this problem: [Permissioned Pointers](https://verus-lang.github.io/verus/verusdoc/vstd/simple_pptr/struct.PPtr.html).
 
@@ -90,7 +90,7 @@ You'll notice that in both the `push` and `pop` algorithms, we never need to mut
 
 ```rust
 // Construct a new StackCell by loading the top address
-let new_stack_cell = StackCell { elem, next: self.top_addr.load() };
+let new_stack_cell = StackCell { elem, next: self.top_address.load() };
 
 // Wrap the new StackCell in a PPtr
 // permission_guarded_new_stack_cell: PPtr<StackCell>
@@ -529,7 +529,7 @@ Second, regarding the stack representation `current_stack_addresses`, the TSM ho
 
 With all of this in mind, lets take a look at the actual implementation.
 
-### Implementation:
+### Well-Formedness:
 
 We already have our foundation of what we will use:
 
@@ -537,12 +537,12 @@ We already have our foundation of what we will use:
 use std::sync::atomic::AtomicUsize;
 
 pub struct TreiberStack {
-    pub top_addr: AtomicUsize,
+    pub top_address: AtomicUsize,
 }
 
 pub struct StackCell {
     pub elem: u32,
-    pub next_addr: usize,
+    pub next_address: usize,
 }
 ```
 
@@ -690,12 +690,12 @@ pub struct AtomicTokens {
 struct_with_invariants!{
     pub struct TreiberStack {
         pub base_address: StackCellAddress,
-        pub top_addr: AtomicUsize<_, AtomicTokens, _>,
+        pub top_address: AtomicUsize<_, AtomicTokens, _>,
         pub instance: Tracked<machine::Instance>,
     }
 
     pub open spec fn wf(self) -> bool {
-        invariant on top_addr with (base_address, instance) is (top_addr: usize, atomic_tokens: AtomicTokens) {
+        invariant on top_address with (base_address, instance) is (top_addr: usize, atomic_tokens: AtomicTokens) {
             true
         }
     }
@@ -708,7 +708,7 @@ First, you'll notice that our aptly named `AtomicTokens` struct has four fields 
 >
 > You'll also notice that we are storing a `Map<StackCellAddress, machine::witnesses>`, whereas all the other tokens are stored without extra structure. If you recall, the `witnesses` field is sharded as a `persistent_map` and, as a result, tokens exist for every key-value pair rather than the field as a whole. Hence, since we are storing a collection of these tokens, we need a set-like structure that can store our collection; a `Map` works best. One key-value pair in this map may look like: `(address, (address, permission))`. Is this clunky? Yes. Do I hate it? Also, yes. But does it work. Yes.
 
-Secondly, you'll notice that our well-formedness condition is always true and would only fail if the `base_address` or `instance` has changed. So what should we include - what does it mean for our stack to be well-formed? Interestingly, we don't actually have a holistic view of the stack even here, we only have a view of the `top_addr`. Of course, we have our stack representation token `current_stack_addresses`, but we do not have a full view of the entire physical stack. We can start with a few basic checks, for example the `base_address` stored in our struct should equal the `base_address` from our TSM. Further, all tokens stored in our struct should actually be from the correct TSM instance:
+Secondly, you'll notice that our well-formedness condition is always true and would only fail if the `base_address` or `instance` has changed. So what should we include - what does it mean for our stack to be well-formed? Interestingly, we don't actually have a holistic view of the stack even here, we only have a view of the `top_address`. Of course, we have our stack representation token `current_stack_addresses`, but we do not have a full view of the entire physical stack. We can start with a few basic checks, for example the `base_address` stored in our struct should equal the `base_address` from our TSM. Further, all tokens stored in our struct should actually be from the correct TSM instance:
 
 ```rust
 // The base address must reflect the TSM base address:
@@ -735,5 +735,118 @@ forall |addr: StackCellAddress| #![auto]
     )
 ```
 
-We also
+With those structural/basic properties out of the way, there are two more categories of invariant clauses we would like to assert: invariants regarding correctness, and invariants that allow us to use the TSM. Starting with invariants regarding correctness, we want to be sure that the stack representation token `current_stack_addresses` has the `base_address` at the bottom, and the `top_addr` at the top:
 
+```rust
+// The base address is always present even before the first push:
+&&& atomic_tokens.witnesses.dom().contains(base_address)
+&&& atomic_tokens.current_stack_addresses.value().contains(base_address)
+&&& atomic_tokens.current_stack_addresses.value().first() == base_address
+
+// The top address is always tracked:
+&&& atomic_tokens.witnesses.dom().contains(top_addr)
+&&& atomic_tokens.current_stack_addresses.value().contains(top_addr)
+&&& atomic_tokens.current_stack_addresses.value().last() == top_addr
+```
+
+We also know, that if there is only one element in our stack representation, then our stack is empty (because the `base_address` is always included in the stack representation). Hence:
+
+```rust
+// If the top is the base, then our stack is empty (we only have the base):
+&&& top_addr == base_address <==> atomic_tokens.current_stack_addresses.value().len() == 1
+```
+
+And that's most of what we need for the stack to be considered correct - remember, the only physical thing that we can reference is the address of the top `StackCell` `top_addr`. Despite this, we also need to assert a few clauses that our TSM asserts. The reasoning for this is simple, when the TSM mints new tokens, the invariants hold. However, Verus does not discharge these invariants everywhere and hence we 'lose' facts about our tokens unless we explicitly state them. Also, remember that our TSM requires the invariants to hold on the tokens we present when calling a transition, if we have lost these facts then our transitions cant be used. Hence, we may include the following invariants in our well-formedness condition that come from the TSM. I won't explain in great detail what they do, since I've talked about them already:
+
+```rust
+// There are no duplicate addresses in our stack
+&&& atomic_tokens.current_stack_addresses.value().no_duplicates()
+
+// The current stack cell addresses is disjoint from the set of all popped stack cell addresses:
+// However, their union should be the domain of the set of all witnesses
+&&& atomic_tokens.current_stack_addresses.value().to_set().disjoint(atomic_tokens.popped_addresses.value())
+&&& atomic_tokens.witnesses.dom() =~= atomic_tokens.current_stack_addresses.value().to_set().union(atomic_tokens.popped_addresses.value())
+&&& atomic_tokens.current_stack_addresses.value().to_set().subset_of(atomic_tokens.witnesses.dom())
+
+// The set of cell addresses should equal the domain of the witness tokens:
+&&& atomic_tokens.addresses.value() == atomic_tokens.witnesses.dom()
+
+// Every witness token's permission points to initialised memory except for the witness of the base address:
+&&& forall |addr: StackCellAddress| #![auto]
+        atomic_tokens.witnesses.dom().contains(addr) ==> (
+            addr != base_address <==> atomic_tokens.witnesses.index(addr).value().is_init()
+        )
+
+// There exists a witness for the next stack cell of every current stack cell (except base):
+&&& forall |addr: StackCellAddress| #![auto]
+        (
+            atomic_tokens.witnesses.dom().contains(addr) &&
+            addr != base_address
+        ) ==>
+        atomic_tokens.witnesses.dom().contains(
+            atomic_tokens.witnesses.index(addr).value().value().next_address
+        )
+
+&&& forall |i: int| #![auto]
+        0 < i < atomic_tokens.current_stack_addresses.value().len() ==> (
+            atomic_tokens.current_stack_addresses.value()[i-1] ==
+            atomic_tokens.witnesses.index(atomic_tokens.current_stack_addresses.value()[i]).value().value().next_address
+        )
+```
+
+### Construction:
+
+We haven't actually written a `push` or `pop` method yet, but we've actually done most of the heavy lifting in the proof already. Let's start by writing the method that constructs a new `TreiberStack`. To start us off, we know that this method should not take any arguments and should return to us a fresh `TreiberStack` that is well formed:
+
+```rust
+pub fn new() -> (treiber_stack: Self)
+    ensures
+        treiber_stack.wf()
+{
+    // TODO
+}
+```
+
+We can start by initialising the TSM. But before we do so, recall that `initialize` requires a permission for the `base_address` and also a map 
+
+```rust
+pub fn new() -> (treiber_stack: Self)
+    ensures
+        treiber_stack.wf()
+{
+    let (base, Tracked(base_perm)) = PPtr::<StackCell>::empty();
+    let base_address = base.addr();
+
+    let tracked permissions = Map::tracked_empty();
+    proof {
+        permissions.tracked_insert(base_address, base_perm);
+    }
+
+    let tracked (
+        Tracked(instance),
+        Tracked(current_stack_addresses),
+        Tracked(popped_addresses),
+        Tracked(addresses),
+        Tracked(witnesses),
+    ) = machine::Instance::initialize(base_perm, permissions);
+
+    let tracked witness_tokens = witnesses.into_map();
+
+    let atomic_tokens = AtomicTokens {
+        current_stack_addresses: Tracked(current_stack_addresses),
+        popped_addresses: Tracked(popped_addresses),
+        witnesses: Tracked(witness_tokens),
+        addresses: Tracked(addresses),
+    };
+
+    assert(current_stack_addresses.value().first() == base_address);
+
+    let top_address = AtomicUsize::new(
+        Ghost((base_address, Tracked(instance))),
+        base_address,
+        Tracked(atomic_tokens),
+    );
+
+    TreiberStack { base_address, top_address, instance: Tracked(instance) }
+}
+```
