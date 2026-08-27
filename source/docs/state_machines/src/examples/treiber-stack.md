@@ -884,4 +884,80 @@ And with that, we have arrived at where most of you likely thought we would star
 
 ### Push:
 
-### Pop
+Lets start with the basics. We know that we are pushing an element of some kind to the stack - we will be using a `u32`. We also know that `push` will loop forever, but Verus won't allow us to do this normally, so we'll have to include `#![cfg_attr(verus_keep_ghost, verifier::exec_allows_no_decreases_clause)]` at the top of our file. Trivially, we will have to construct a new `StackCell` and wrap it in a `PPtr` as well. Finally, we want the stack to be well-formed both when we start and when we finished. Combining, we can start with:
+
+```rust
+pub fn push(&self, elem: u32)
+    requires
+        self.wf(),
+    ensures
+        self.wf(),
+{
+    loop
+        invariant
+            self.wf(),
+    {
+        let new_stack_cell = StackCell { elem, next_address: self.top_address.load() };
+        let (permission_guarded_new_stack_cell, Tracked(new_stack_cell_permission)) = PPtr::new(
+            new_stack_cell,
+        );
+
+        // TODO
+    }
+}
+```
+
+Now that we have loaded the `top_address` and constructed a new permission-wrapped `StackCell`, we can finally attempt to push. That might look something like this:
+
+```rust
+self.top_address.compare_exchange(
+    permission_guarded_new_stack_cell.read(Tracked(&new_stack_cell_permission)).next_address,
+    permission_guarded_new_stack_cell.addr()
+);
+```
+
+We compare what is stored in `self.top_address` with what we previously loaded. If that value is still the same, then we exchange the address of our new cell `permission_guarded_new_stack_cell.addr()` with the `top_address`. However, there is a problem with this - our well-formedness condition will not pass as we haven't used our TSM, nor have we updated any of our tokens in the `AtomicUsize`. So what does Verus have to allow us to synchronise this atomic action with a ghost action? The [atomic_with_ghost](https://verus-lang.github.io/verus/verusdoc/vstd/atomic_ghost/macro.atomic_with_ghost.html) macro!
+
+Essentially, this macro allows us to synchronise an `exec` atomic action with a series of ghost actions. Since the actions are all ghost, we may perform multiple of them and still have the overall effect be synchronised with a single atomic action. I.e. we can call multiple transitions, properties and ghost field updates 'at the same time' as an atomic action with the goal being that our updated `AtomicUsize` still passes the well-formedness check. Lets see what that looks like:
+
+```rust
+atomic_with_ghost!(
+    self.top_address => compare_exchange(
+        permission_guarded_new_stack_cell.read(Tracked(&new_stack_cell_permission)).next_address,
+        permission_guarded_new_stack_cell.addr()
+    );
+    returning previous_head_address_result;
+
+    ghost points_to_inv => {
+        if let Ok(_) = previous_head_address_result {
+
+            // Proving that there does not already exist a permission for the cell in the TSM (or our tokens by extension):
+            if points_to_inv.witnesses@.dom().contains(new_stack_cell_permission.addr()) {
+                let tracked witness_token = points_to_inv.witnesses.tracked_borrow(new_stack_cell_permission.addr());
+                let tracked stack_cell_permission_reference = self.instance.get_permission_reference(witness_token.key(), witness_token.value(), &witness_token);
+                new_stack_cell_permission.is_distinct(stack_cell_permission_reference);
+                assert(false);
+            }
+
+            let ghost pre_current_stack_addresses = Ghost(points_to_inv.current_stack_addresses@.value());
+
+            let tracked witness_token = self.instance.push(
+                new_stack_cell_permission,
+                &mut points_to_inv.current_stack_addresses,
+                &mut points_to_inv.addresses,
+                new_stack_cell_permission
+            );
+
+            assert(pre_current_stack_addresses@ =~= pre_current_stack_addresses.push(witness_token.value().addr()).drop_last());
+
+            // Insert the witness token for the new stack cell into our map:
+            points_to_inv.witnesses.tracked_insert(witness_token.key(), witness_token);
+
+            // The push correctly updated our view of the stack:
+            assert(points_to_inv.current_stack_addresses.value().last() == witness_token.key());
+        }
+    }
+);
+```
+
+### Pop:
