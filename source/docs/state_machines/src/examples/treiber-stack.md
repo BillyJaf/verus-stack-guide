@@ -75,18 +75,18 @@ The solution is actually somewhat trivial, but also undesireable from a performa
 
 ### Tokenized State Machine Fields:
 
-So let's have a go at an implementation and an explanation as to why tokenized state machines are perfect for this data structure.
-
-Firstly, looking at the above pseudo-code, you'll notice that there are several times where we did something like this while popping elements:
+So let's have a go at an implementation and an explanation as to why tokenized state machines are perfect for this data structure. Firstly, looking at the above pseudo-code, you'll notice that we did something like this while popping elements:
 ```rust
 *(A as *const StackCell).elem
 *(A as *const StackCell).next_address
 ```
 You might notice that this is `unsafe`, and as a result this dereference must occur within an `unsafe` block within normal Rust - not good! Luckily, Verus has the perfect tool for bypassing this problem: [Permissioned Pointers](https://verus-lang.github.io/verus/verusdoc/vstd/simple_pptr/struct.PPtr.html).
 
-From the source, a `PPtr<V>` is a *wrapper around a raw pointer to a heap-allocated `V`* - in our case, we will be using a `PPtr<StackCell>`. Essentially, when we create a `PPtr<V>`, we are given an `exec` pointer and a `Tracked` permission. To read the underlying memory of the pointer, we must have a `Tracked` reference to the permission, and to write to the underlying memory we need a `Tracked` mutable reference to the permission. The reason that the permission is wrapped in `Tracked` throughout all of this is because it is a `tracked` ghost object - it is linear and erased at compile time. Wrapping a proof object with `Tracked` allows it to be passed as an argument to a function (or returned from one) while still having the proof object erased at compile time, leaving only a zero-sized `Tracked` wrapper. No runtime penalty required, neat! The permissioned pointer is perfect for our use case. 
+From the source, a `PPtr<V>` is a *wrapper around a raw pointer to a heap-allocated `V`* - in our case, we will be using a `PPtr<StackCell>`. Essentially, when we create a `PPtr<V>`, we are given an `exec` pointer and a `tracked` permission. To read the underlying memory of the pointer, we must have a reference to the `tracked` permission, and to write to the underlying memory we need a mutable reference to the `tracked` permission. What is important to understand is what `tracked` means and why it is important that the permission, `PointsTo<StackCell>`, is marked with it.
 
-You'll notice that in both the `push` and `pop` algorithms, we never need to mutate any underlying data of a `StackCell`. When we create a `StackCell`, it exists as a constant until the process terminates - the only data that is mutated is the `AtomicUsize` that houses the `top_addr` (which we'll discuss soon). To show you what the start of the `push` operation looks like, and how we can use permissioned pointers, we do the following (where `elem` is the element we are pushing):
+When something is marked as `tracked`, that means that it will be erased at compile-time, however, Rust's linearity and borrow checking are still applied. Since `PointsTo<StackCell>` does not implement `Copy` or `Clone`, yet is marked as `tracked`, we get Rust's linearity and borrow checking guarantees on a compile-time erased type (which incurs no runtime penalty). Note, `tracked` is different to `Tracked` - wrapping a `proof` mode object in `Tracked` allows it to be passed around as an argument to functions etc. The `proof` object will still be erased at compile-time, leaving only a zero-sized `Tracked` wrapper, but it is important to understand that `tracked` is a variable mode, whereas `Tracked` is a wrapper for moving `proof` mode objects.
+
+You'll notice that in both the `push` and `pop` algorithms, we never need to mutate any underlying data of a `StackCell`. When we create a `StackCell`, it exists as a constant until the process terminates - the only data that is mutated is the `AtomicUsize` that houses the `top_address` (which we'll discuss soon). To show you what the start of the `push` operation looks like, and how we can use permissioned pointers, we do the following (where `elem` is the element we are pushing):
 
 ```rust
 // Construct a new StackCell by loading the top address
@@ -100,9 +100,9 @@ let (permission_guarded_new_stack_cell, Tracked(new_stack_cell_permission)) = PP
 );
 ```
 
-So, what you need to remember is that instead of dereferencing raw pointers, we can create a permissioned pointer that points to our `StackCell`. Then, to read from the underlying data of the `PPtr<StackCell>`, we only need a reference to the related permission `PointsTo<StackCell>`. As we only need a reference, these permissions can exist in a shared data structure that all threads can access. Once again, Verus saves the day! This is where it becomes clear why a tokenized state machine is the perfect companion for our implementation.
+So, what you need to remember is that instead of dereferencing raw pointers, we can create a permissioned pointer that points to our `StackCell`. Then, to read from the underlying data of the `PPtr<StackCell>`, we only need a reference to the related permission `PointsTo<StackCell>`. As we only need a reference, these permissions can exist in a shared data structure that all threads can access. Recall, the permissions are entirely erased at compile-time, so this shared data structure can also be compile-time erased; we can store them in a field of a tokenized state machine!
 
-Looking through the guide, we find the [storage_map](https://verus-lang.github.io/verus/state_machines/strategy-storage-map.html) sharding strategy which even says that the tokens stored are typically of type `PointsTo<V>`. Essentially, we can shard a field in our tokenized state machine with the `storage_map` strategy, and deposit our permissions in this field. Then, when we want to read the data from a `PPtr<StackCell>`, we can use the `guard` command on the field to obtain a reference to the relevant `PointsTo<StackCell>`. To visualise this field, our current tokenized state machine might look something like this:
+Looking through the guide, we find the [storage_map](https://verus-lang.github.io/verus/state_machines/strategy-storage-map.html) sharding strategy which even says that the tokens stored are typically of type `PointsTo<V>`. Essentially, we can shard a field in our tokenized state machine with the `storage_map` strategy, and `deposit` our permissions in this field. Then, when we want to read the data from a `PPtr<StackCell>`, we can use the `guard` command on the field to obtain a reference to the relevant `PointsTo<StackCell>`. To visualise this field, our current tokenized state machine might look something like this:
 
 ```rust
 type StackCellAddress = usize;
@@ -117,7 +117,7 @@ tokenized_state_machine!{
 }
 ```
 
-You'll notice that we've used a `StackCellAddress` as the key to the map. This is somewhat redundant as `PointsTo<V>` has a method `addr` that returns the address that the permission is for, but every `Map` entry requires a key, so this will do. We can tie this back in later by having an invariant asserting that every permission's address and map key are equal. When a `push` occurs, we can update the `permissions` field in our TSM to include the new permission `PointsTo<StackCell>`. Other threads can `guard` this token through the TSM to obtain a reference to the permission and read the underlying memory, neat!
+You'll notice that we've used a `StackCellAddress` as the key to the map. This is somewhat redundant as `PointsTo<V>` has a method `addr` that returns the address that the permission is for, but every `Map` entry requires a key, so this will do. We can tie this back in later by having an invariant asserting that every permission's address and map key are equal. When a `push` occurs, we can update the `permissions` field in our TSM to include the new permission `PointsTo<StackCell>`. Other threads can `guard` this token through the TSM to obtain a reference to the permission and read the underlying memory. 
 
 Let's have a think about what other fields we would need in our TSM. Having another look through the [storage_map](https://verus-lang.github.io/verus/state_machines/strategy-storage-map.html) documentation at the `guard` command, we can notice something interesting. The command syntactically looks like:
 ```rust
@@ -135,9 +135,10 @@ And in a transition has meaning:
 // permission: PointsTo<StackCell>
 assert field.dom().contains(StackCellAddress) && field[StackCellAddress] == permission;
 ```
-It is clear that we will need some way to keep track of what permissions are stored within our map so that we may retrieve references to them. From this, you might ask yourself "if we already deposited the permission, and the permission is linear, then how can we pass it as an argument to the guard?" - great question. We can use a pattern that can be seen used in various other proofs (for example [here](https://github.com/verus-lang/verus/blob/92f466f247f45128c630d1c843fd6e27d2115587/examples/state_machines/maps.rs)). 
 
-In our TSM, we can add another map-like field that is identical to our storage map, with the caveat that this field holds `Ghost` copies of our `tracked` tokens. Since `Ghost` types are erased at compile time and can freely 'copy' any value (even from things that do not implement `Copy`), they fit our requirements perfectly. If we can have another field that is identical to our `storage_map` value wise, but is not `tracked`, then we may use those tokens as witnesses for the `tracked` tokens. This is what that looks like in practice:
+It's important to understand that the `storage_map` is somewhat unique in that depositing permissions does not return a token to the user. If it did present a token to the user, then we could use that token later to `guard` the related permission; we need to implement our own 'witness' token system for retreiving references to permissions. We can use a pattern that can be seen used in various other proofs (for example [here](https://github.com/verus-lang/verus/blob/92f466f247f45128c630d1c843fd6e27d2115587/examples/state_machines/maps.rs)). In our TSM, we can add another map-like field that is identical to our storage map, with the caveat that this field holds `ghost` copies of our `tracked` tokens.
+
+Like the `tracked` variable mode, objects that are marked with the `ghost` variable mode are erased at compile time. However, unlike the `tracked` variable mode, things that are marked as `ghost` are not checked with Rust's borrow-checker, which allows for values to be freely copied, even when they don't implement `Copy`. If we have another field that is identical to our `storage_map` value wise, but only holds `ghost` copies, then we may use those tokens as witnesses for the `tracked` tokens. This is what that looks like in practice:
 
 ```rust
 type StackCellAddress = usize;
@@ -160,12 +161,9 @@ tokenized_state_machine!{
 }
 ```
 
-Firstly, you'll notice that we are sharding this `witness` field with the [persistent_map](https://verus-lang.github.io/verus/state_machines/strategy-persistent-map.html) strategy. The reason for this are twofold:
- 1. When inserting a key-value pair to the map, a fresh token that implements `Copy` is created. Hence, there can be any such number of tokens for a key and hence we may distribute witnesses to many threads at once.
+Firstly, you'll notice that we are sharding this `witness` field with the [persistent_map](https://verus-lang.github.io/verus/state_machines/strategy-persistent-map.html) strategy. When you `add` a `ghost` key-value pair to a `persistent_map`, you are returned a token - we can use this token as our witness for the `tracked` permission. Also, the `persistent_map` strategy has no `remove` method, which is fine since we are allowing `PPtr<StackCell>`s to leak into the heap, we never need to revoke a witness. 
 
- 2. Since we are allowing `PPtr<StackCell>`s to leak into the heap, we never need to revoke a witness. The `persistent_map` strategy has no `remove` method.
-
-Secondly, you'll notice that we are asserting the two fields are always equal to each other. This way, we can be sure that whenever we have one of these witness tokens, while we may not be able use it to directly to read from a `PPtr<StackCell>`, we can use it to `guard` a `tracked` permission and use *that* permission to read the memory. In practice, that property looks like this:
+Secondly, you'll notice that we have an invariant asserting that the two fields are always equal. This way, we can be sure that whenever we a witness token, while we may not be able use it to directly to read from a `PPtr<StackCell>`, we can use it to `guard` a `tracked` permission and use *that* permission to read the memory. In practice, that property looks like this:
 
 
 ```rust
@@ -176,14 +174,14 @@ property!{
     }
 }
 ```
-This all hinges on the invariant that we stated in the TSM above, Verus knows that the maps are equal and therefore it knows that if we have a `(StackCellAddress, PointsTo<StackCell>)` pair in our `witnesses` map, then there must be an equal pair in the `permissions` map. The only difference is that the `permissions` map "stores" the `tracked` value that is useable. So what else do we need in our TSM?
+This all hinges on the invariant that we stated in the TSM above, Verus knows that the maps are equal and therefore it knows that if we have a `(StackCellAddress, PointsTo<StackCell>)` pair in our `witnesses` map, then there must be an equal pair in the `permissions` map. The only difference is that the `permissions` map 'stores' the `tracked` value that is useable.
 
-You might notice that, so far, all of our fields are sharded with map strategies. Since we require both of these maps to be equal, we know that when we want to insert a key-value pair, we must demonstrate the more binding requirement out of the two. i.e. to insert a key `k` into these maps, we must show:
+So far, you might notice that all of our fields are sharded with map strategies. Since we require both of these maps to be equal, we know that when we want to insert a key-value pair, we must demonstrate the more binding requirement out of the two. i.e. to insert a key `k` into these maps, we must show:
 ```rust
 !permissions.dom().contains(k);
 ```
 
-But there is one problem with this, since the `permissions` field is sharded with the `storage_map` strategy, attempting to `require` this fact in a transition results in an error. The following is an example transition that reflects how we might try to show that a key is not in the map:
+But there is one problem with this, since the `permissions` field is sharded with the `storage_map` strategy, attempting to naively `require` this fact in a transition results in an error. The following is an example transition that reflects how we might try to show that a key is not in the map:
 
 ```rust
 transition!{
@@ -209,7 +207,7 @@ So, if we can't refer to a `storage_map` field, then how else might we demonstra
 >
 > Therefore, this field we are about to include might no longer be necessary in the future, we urge the reader to check the documentation for more details!
 
-How will another field solve our problems? Well, we can have a field with type `set` and shard it with the [variable](https://verus-lang.github.io/verus/state_machines/strategy-variable.html) strategy. Then, we may have an invariant that this set is equal to the domain of our maps. Now, when we want to insert into the maps, we only need to `require` that the key is not within the set - a legal expression! Here is an example of what that field, invariant and transition might look like:
+How will another field solve our problems? Well, we can have a field with type `set` and shard it with the [variable](https://verus-lang.github.io/verus/state_machines/strategy-variable.html) strategy with an invariant that this set is equal to the domain of our maps. Now, when we want to insert into the maps, we only need to `require` that the key is not within the set - a legal expression! Here is an example of what that field, invariant and transition might look like:
 
 ```rust
 type StackCellAddress = usize;
@@ -251,7 +249,8 @@ tokenized_state_machine!{
     }
 }
 ```
-Despite the fact that our program will be multithreaded, it is fine to use a field sharded with the `variable` strategy - you'll see that we will only be interacting with this field through atomics. 
+
+The point of this, is that the this `variable` sharded `set` serves as a birds-eye view of all the tokens from the `persistent_map`. Even if we held all of the tokens from the TSM in one location, and presented them to the TSM when we called the transition, we still wouldn't have a way to assert that this collection of tokens truly contains every single token ever minted; the `variable` `set` sidesteps this problem. The downside of using this method is that there is one singular `addresses` token, so we may not give multiple threads mutable access to it. This sounds like a problem, but as you'll see later, we don't need to give mutable references to this token to multiple threads.
 
 On top of this, it is also required in our TSM to have a field that reflects our real `exec` stack. If this field represents our stack, and we only ever interact with this field through stack operations (push and pop) within transitions, then we can be sure that our implementation is functionally correct.
 
@@ -261,22 +260,9 @@ On top of this, it is also required in our TSM to have a field that reflects our
 >
 > Essentially, without a linearised history, the program could technically just do nothing when a `push` or a `pop` is called, and this would satisfy all specifications provided (provided that the intial state satisfies them). Adding these new witness tokens demonstrates that something has actually occurred, but adding them is too complicated for this guide.
 >
-> Unless you want to be very rigorous, you can forget that I sai anything!
+> Unless you want to be very rigorous, you can forget that I said anything!
 
-So, to add those stack-representation fields to our TSM, we might include fields like this:
-
-
-```rust
-type StackCellAddress = usize;
-
-#[sharding(variable)]
-pub current_stack_addresses: Seq<StackCellAddress>,
-
-#[sharding(variable)]
-pub popped_addresses: Set<StackCellAddress>,
-```
-
-And have them interact with the field that maintains all addresses that have housed a `StackCell` in our stack like so:
+So, to add those stack-representation fields to our TSM, we might do something like this:
 
 ```rust
 type StackCellAddress = usize;
@@ -416,7 +402,7 @@ pub fn current_stack_has_witnesses_inv(&self) -> bool {
 }
 ```
 
-Great, we already have a fair few invariants - let's have a think about what else we need to include. Recall that we are using a `storage_map` to keep the `permissions`, and a `persistent_map` to keep the `witnesses`. It was mentioned earlier that the key of each key-value pair can be the associated address of the value. That is to say:
+Great, we already have a fair few invariants - let's have a think about what else we need to include. Recall that we are using a `storage_map` to shard `permissions`, and a `persistent_map` to shard `witnesses`. It was mentioned earlier that the key of each key-value pair can be the associated address of the value. That is to say:
 
 ```rust
 #[invariant]
@@ -483,7 +469,7 @@ init!{
 }
 ```
 
-Remember, now that we have our invariants, our transitions must satisfy them after finishing. One of our invariants specified that the `base_permission` must always be present in our maps, hence, we pass it as a variable to `initialize` so we can populate the maps. Also, despite `PointsTo<StackCell>` not implementing `Copy` we are free to use it in several places with no compile-time errors. Huh? Remember, the `permissions` `storage_map` is holding the linear `tracked` permission, `addresses` and `witnesses` both create `Ghost` tokens - they are free to copy even non-copyable variables since they don't get compiled and can't be used to read a `PPtr`. Next, we need to write our most important transitions; `push` and `pop`. We'll start with push - again, hopefully nothing should be difficult to comprehend:
+Remember, now that we have our invariants, our transitions must satisfy them after finishing. One of our invariants specified that the `base_permission` must always be present in our maps, hence, we pass it as a variable to `initialize` so we can populate the maps. Also, despite `PointsTo<StackCell>` not implementing `Copy` we are free to use it in several places with no compile-time errors. Huh? Remember, the `permissions` `storage_map` holds the linear `tracked` permission, while `addresses` and `witnesses` both create tokens whose value is `ghost` and hence freely copyable. Next, we need to write our most important transitions; `push` and `pop`. We'll start with push - again, hopefully nothing should be difficult to comprehend:
 
 ```rust
 transition!{
@@ -500,7 +486,7 @@ transition!{
 }
 ```
 
-From the perspective of our TSM, pushing to the stack means depositing a permission and updating our stack representation. The permission should be initialised, have a `next` value that points to the last address in our stack representation, and should not have already been pushed to the stack. Once we have met these criteria, we update the relevant fields: add the address to the set of all addresses, push the address to the end of the stack representation, deposit the permission and add a witness. The `push` transition is relatively simple - we basically just add the permission to the TSM - now let's have a look at `pop`:
+From the perspective of our TSM, pushing to the stack means depositing a permission and updating our stack representation. The permission should be initialised, have a `next` value that points to the last address in our stack representation `Seq`, and should not have already been pushed to the stack. Once we have met these criteria, we update the relevant fields: add the address to the set of all addresses, push the address to the end of the stack representation, deposit the permission and add a witness. The `push` transition is relatively simple - we basically just add the permission to the TSM - now let's have a look at `pop`:
 
 ```rust
 transition!{
@@ -515,7 +501,7 @@ transition!{
 }
 ```
 
-Wow, it's even easier! Since we are allowing `PPtr<StackCell>`s to live permanently, we never need to remove `witnesses` or `permissions`. To pop, we require that the address we are popping is not the `base_address` and that the permission is the last element in our stack representation. Once we know this, we proceed: we assert that permission actually came from the `witnesses` map, we add the address of the permission to the `popped_addresses` set and remove the last element from the stack representation.
+Wow, it's even easier! Since we are allowing `PPtr<StackCell>`s to live permanently, we never need to remove `witnesses` or `permissions`. To pop, we require that the address we are popping is not the `base_address` and that the permission is the last element in our stack representation. Once we know this, we proceed: we assert that the permission is a member of the `witnesses` map, we add the address of the permission to the `popped_addresses` set and remove the last element from the stack representation.
 
 And those are all the transitions we need. We will need a handful of properties, but those will only make sense in the context of future problems we run into.
 
@@ -523,9 +509,9 @@ And those are all the transitions we need. We will need a handful of properties,
 
 So what does the tokenised state machine actually buy us? Well, there are two key parts of the state machine that we have created; the `StackCell` permission storage, and the stack representation.
 
-First, regarding the permissions, the TSM holds the permissions for all `StackCell`s that have ever been pushed to the stack. It is important to note, both the TSM - and therefore the permissions that it holds - are erased at compile time. Irrespective of this fact, we still use the TSM to store our permissions when we `push` to the stack, and hence we retrieve references to `PointsTo<StackCell>` permissions from the TSM when we `pop`.
+First, regarding the permissions, the TSM holds the permissions for all `StackCell`s that have ever been pushed to the stack. It is important to note, both the TSM - and therefore the permissions that it holds - are erased at compile-time. Hence, the TSM doesn't physically store anything, but it mimics something that does. At the call site of `push` we are given a witness token (also compile-time erased) that the permission is now included in the TSM. This token is sufficient proof at the call site of `pop` that a permission exists for `top_address`. Hence, we may safely dereference (read from a `PPtr`) `top_address` into a `StackCell`. All of these checks are done at compile time and are facilitated by the TSM.
 
-Second, regarding the stack representation `current_stack_addresses`, the TSM holds a `Seq<StackCellAddress>` that represents the physical stack. However, the TSM alone does not relate it's representation to the physical stack, that is something that we will have to do ourselves. The stack representation is only interacted with via the `push` and `pop` transitions, which are correct stack operations trivially. Hence, if we are able to relate `current_stack_addresses` to our physical stack, and the `push` and `pop` transitions with our physical functions, then our stack is correct.
+Second, regarding the stack representation `current_stack_addresses`, the TSM holds a `Seq<StackCellAddress>` that represents the physical stack. Note, the TSM alone does not relate it's representation to the physical stack, that is something that we will have to do ourselves. However, if we can relate this representation to the `exec` stack, and this representation is only interacted with via the `push` and `pop` transitions, then our stack is functionally correct.
 
 With all of this in mind, lets take a look at the actual implementation.
 
@@ -1083,3 +1069,38 @@ pub fn push(&self, elem: u32)
 ```
 
 ### Pop:
+Our `pop` method has the same skeleton as `push`; we loop infinitely until we successfully pop an element:
+```rust
+pub fn pop(&self) -> (elem: Option<u32>)
+    requires
+        self.wf(),
+    ensures
+        self.wf(),
+{
+    loop
+        invariant
+            self.wf(),
+    {
+       // TODO
+    }
+}
+```
+However, you may recall that we need to do two checks when we pop. First, we check if the stack is empty and return nothing to the user if this is the case. Second, if the stack is not empty, then we derefence the `StackCell` address to get the `next` address which we will replace the old `top_address` if the CAS is successful. Lets first look at the empty-stack check:
+
+```rust
+let tracked stack_head_witness;
+
+let mut top_address =
+    atomic_with_ghost!{
+    self.top_address => load();
+    returning addr;
+
+    ghost atomic_tokens => {
+        stack_head_witness = *atomic_tokens.witnesses.tracked_borrow(addr);
+    }
+};
+
+if top_address == self.base_address {
+    return None;
+}
+```
