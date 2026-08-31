@@ -880,7 +880,7 @@ And with that, we have arrived at where most of you likely thought we would star
 
 ### Push:
 
-Lets start with the basics. We know that we are pushing an element of some kind to the stack - we will be using a `u32`. We also know that `push` will loop forever, but Verus won't allow us to do this normally, so we'll have to include `#![cfg_attr(verus_keep_ghost, verifier::exec_allows_no_decreases_clause)]` at the top of our file. Trivially, we will have to construct a new `StackCell` and wrap it in a `PPtr` as well. Finally, we want the stack to be well-formed both when we start and when we finished. Combining, we can start with:
+Lets start with the basics. We know that we are pushing an element of some kind to the stack - we will be using a `u32`. We also know that `push` will loop forever until it is successful, but Verus won't allow us to loop without a `decreases` clause, so we'll have to include `#![cfg_attr(verus_keep_ghost, verifier::exec_allows_no_decreases_clause)]` at the top of our file. Trivially, we will have to construct a new `StackCell` and wrap it in a `PPtr` as well. Finally, we want the stack to be well-formed both when we start and finish:
 
 ```rust
 pub fn push(&self, elem: u32)
@@ -912,7 +912,7 @@ self.top_address.compare_exchange(
 );
 ```
 
-We compare what is stored in `self.top_address` with what we previously loaded, if the value is still the same, then we exchange the address of our new cell `permission_guarded_new_stack_cell.addr()` with the `top_address`. However, there is a problem with this - our well-formedness condition will not pass as we haven't used our TSM, nor have we updated any of our tokens in the `AtomicUsize`. We want to synchronise this atomic action with a TSM-transition and ghost token update. So what does Verus have to allow us to synchronise this atomic action with a ghost action? The [atomic_with_ghost](https://verus-lang.github.io/verus/verusdoc/vstd/atomic_ghost/macro.atomic_with_ghost.html) macro!
+We compare what is stored in `self.top_address` with what we previously loaded and, if the value is still the same, we exchange the address of our new cell `permission_guarded_new_stack_cell.addr()` with the `top_address`. However, there is a problem with this - our well-formedness condition will fail to assert as we haven't used our TSM, nor have we updated any of our tokens in the `AtomicUsize`. We want to synchronise this atomic action with a TSM transition and ghost token update. So what does Verus have to allow us to synchronise this atomic action with a ghost action? The [atomic_with_ghost](https://verus-lang.github.io/verus/verusdoc/vstd/atomic_ghost/macro.atomic_with_ghost.html) macro!
 
 Essentially, this macro allows us to synchronise an `exec` atomic action with a series of ghost actions. Since the actions are all ghost, we may perform multiple of them and still have the overall effect be synchronised with a single atomic action. I.e. we can call multiple TSM-transitions, TSM-properties and ghost field updates 'at the same time' as an atomic action with the goal being that our updated `AtomicUsize` still passes the well-formedness check. Lets first take a look at how the `atomic_with_ghost` macro looks:
 
@@ -931,7 +931,7 @@ atomic_with_ghost!(
 );
 ```
 
-There are three things that are happening here. First, give the macro the `exec` atomic action:
+There are three things that are happening here. First, the macro needs the `exec` atomic action:
 ```rust
 self.top_address => compare_exchange(
     permission_guarded_new_stack_cell.read(Tracked(&new_stack_cell_permission)).next_address,
@@ -948,7 +948,7 @@ prev == x && next == y && ret == Ok(prev) //success
 OR 
 prev != x && next == prev && ret == Err(prev) //failure
 ```
-Finally, we access the ghost-state associated with our `AtomicUsize` by unpacking it and naming it `atomic_tokens`. Also, since we know that we will only update our state if the CAS was successful, we only need to account for this case:
+Hence, our value `previous_head_address_result` will take the form `Ok(_)` if the CAS was successful, and `Err(_)` otherwise. Finally, we access the ghost-state associated with our `AtomicUsize` by unpacking it and naming it `atomic_tokens`. Also, since we know that we will only update our state if the CAS was successful, we only need to account for the case of `previous_head_address_result.is_ok()`:
 ```rust
 ghost atomic_tokens => {
     if let Ok(_) = previous_head_address_result {
@@ -956,7 +956,7 @@ ghost atomic_tokens => {
     }
 }
 ```
-Great, so if we have reached this point, then our CAS was successful - so how do we need to update the state such that our `AtomicUsize` is well-formed? Remember that part of the purpose of the TSM is to mirror the actions that are taken by our `exec` stack, and we have already constructed a `push` transition in our TSM which returns a new token back to the user. In an ideal world, we would only need to call this transition and then add the token we received to the `AtomicUsize`'s associated state:
+Great, so if we have reached this point, then our CAS was successful - so how do we need to update the state such that our `AtomicUsize` is well-formed after the `exec` `usize` is updated? Remember that part of the purpose of the TSM is to mirror the actions that are taken by our `exec` stack, and we have already constructed a `push` transition in our TSM which takes a `PointsTo<StackCell>` and returns a witness token back to the user. In an ideal world, we would only need to call this transition and then add the token we received to the `AtomicUsize`'s associated state:
 ```rust
 ghost atomic_tokens => {
     if let Ok(_) = previous_head_address_result {
@@ -972,14 +972,13 @@ ghost atomic_tokens => {
 }
 ```
 
-However, this alone will not compile. Verus complains as it cannot prove that the `new_stack_cell_permission` we are depositing into the state machine is not already present. Of course, we know that it is not already present since we just constructed this `PPtr` and `PointsTo<StackCell>` moments ago - so how can we convince Verus that this is unique? We may add a [property](https://verus-lang.github.io/verus/state_machines/properties.html) in the TSM and use it to derive a contradication!
+However, this alone will not compile. Verus complains as it cannot prove that the `new_stack_cell_permission` we are depositing into the state machine is not already present in the TSM. Of course, we know that it is not already present since we just constructed this `PPtr` and `PointsTo<StackCell>` moments ago - so how can we convince Verus that this is unique? We may add a [property](https://verus-lang.github.io/verus/state_machines/properties.html) in the TSM and use it to derive a contradication!
 
 Our argument goes like this:
- 1. We own a `tracked` `PointsTo` which is linearly typed.
- 2. We deposit `tracked` `PointsTo`s into our TSM, and we may later obtain a reference to any such `PointsTo`.
- 3. Verus cannot (without help) guarantee that the `PointsTo` that we hold isn't already in the TSM.
- 4. If the `PointsTo` that we hold is already in the TSM, then we may obtain a reference to it.
- 5. Now we have two distinct (since they are linear) `PointsTo` permissions to the same memory region - contradiction.
+ 1. We own a `PointsTo` which is linearly typed.
+ 2. If we deposit a `PointsTo` into our TSM, we may later obtain a reference to it.
+ 3. If the `PointsTo` that we hold is already in the TSM, then we may obtain a reference to it.
+ 4. Now we have ownership of a `PointsTo` and a reference to another `PointsTo` that are distinct (linearity) but point to the same memory region - contradiction.
  6. Therefore, the `PointsTo` that we hold is not already in the TSM.
 
 To actually use this argument, we add the following `property` to our TSM:
@@ -995,7 +994,7 @@ property!{
 }
 ```
 
-This property doesn't alone provide the contradiction, but it does export the fact that if we have two permissions that point to the same region of memory, then the permissions are equal. To use this fact in our `atomic_with_ghost` macro, we add the following logic:
+This property doesn't alone provide the contradiction, but it does export the fact that if we have two permissions that point to the same region of memory, then the permissions are equal. Since they are equal, they guard the same memory, but this is impossible as they are distinct. To use this fact in our `atomic_with_ghost` macro, we add the following logic:
 
 ```rust
 if atomic_tokens.witnesses@.dom().contains(new_stack_cell_permission.addr()) {
@@ -1006,12 +1005,12 @@ if atomic_tokens.witnesses@.dom().contains(new_stack_cell_permission.addr()) {
 }
 ```
 
-If our `AtomicUsize`'s state `atomic_tokens` contains a witness token with address equal to our newly constructed permission's address, then we present this token and our new token to the property we just defined. This property exports that the two permissions that we have are equal, however we make use of the [is_distinct](https://verus-lang.github.io/verus/verusdoc/vstd/simple_pptr/struct.PointsTo.html#method.is_distinct) proof to show that these permissions must be distinct. Combining these, we may `assert(false)` which informs Verus that our initial assumption was incorrect - i.e. Our `AtomicUsize`'s state `atomic_tokens` does not contain a witness token with address equal to our newly constructed permission's address. From here, we are free to use our TSM's transition as before.
+If our `AtomicUsize`'s state - `atomic_tokens` - contains a witness token with address equal to our newly constructed permission's address, then we present this token and our new token to the property we just defined. This property exports that the two permissions that we have are equal, however we make use of the [is_distinct](https://verus-lang.github.io/verus/verusdoc/vstd/simple_pptr/struct.PointsTo.html#method.is_distinct) proof to show that these permissions must guard distinct memory regions. Combining these, we may `assert(false)` as we have asserted both that the memory they guard is the same, and that the memory that they guard is distinct. The contradiction informs Verus that this branch is not possible -our `AtomicUsize`'s state `atomic_tokens` does not contain a witness token with address equal to our newly constructed permission's address. From here, we are free to use our TSM's transition as before.
 
-From here, all we have to do is return - our `push` operation is complete as we have synced our `exec` CAS with correctly updating our associated ghost state through the TSM.
+All that's left to do now is return - our `push` operation is complete as we have synced our `exec` CAS with correctly updating our associated ghost state through the TSM.
 
 > **Note:**
-> There are a few other minor assertions that we need to discharge to Verus, but these are all trivial and not related to the generaly proof structure.
+> There are a few other minor assertions that we need to discharge to Verus, but these are all trivial and not related to the generaly proof structure. These assertions are more about triggering trivial facts that Verus doesn't discharge globally.
 >
 
 Our final `push` operation looks like this:
@@ -1095,7 +1094,7 @@ pub fn pop(&self) -> (elem: Option<u32>)
     }
 }
 ```
-However, you may recall that we need to do two checks when we pop. First, we check if the stack is empty and return nothing to the user if this is the case. Second, if the stack is not empty, then we derefence the `StackCell` address to get the `next` address which we will replace the old `top_address` if the CAS is successful. Lets first look at the empty-stack check:
+However, you may recall that we need to do two checks when we pop. First, we check if the stack is empty and return nothing to the user if this is the case. Second, if the stack is not empty, then we derefence the `StackCell` address to get the `next` address which will replace the old `top_address` if the CAS is successful. Lets first look at the empty-stack check:
 
 ```rust
 let tracked stack_head_witness;
