@@ -1031,7 +1031,7 @@ pub fn push(&self, elem: u32)
             new_stack_cell,
         );
 
-        let mut push_result =
+        let push_result =
             atomic_with_ghost!(
             self.top_address => compare_exchange(
                 permission_guarded_new_stack_cell.read(Tracked(&new_stack_cell_permission)).next_address,
@@ -1099,8 +1099,7 @@ However, you may recall that we need to do two checks when we pop. First, we che
 ```rust
 let tracked stack_head_witness;
 
-let mut top_address =
-    atomic_with_ghost!{
+let top_address = atomic_with_ghost!{
     self.top_address => load();
     returning addr;
 
@@ -1113,3 +1112,64 @@ if top_address == self.base_address {
     return None;
 }
 ```
+
+That should hopefully make sense: the `exec` atomic action we are doing is loading the the `top_address` an we can name the result of this load `addr`. Then, the ghost action that we sync with this load is retreiving a witness for this address that we can use later. Finally, if `top_address == self.base_address`, then the stack is empty; we may return `None` to the user.
+
+Now, we have a witness token which informs us that there is indeed a valid permission poitner to the `StackCell` stored at the `top_address`, but we haven't actually got the permission. We can use the property `get_permission_reference` that we created before!
+```rust
+let tracked stack_cell_permission_reference;
+proof {
+    stack_cell_permission_reference =
+    self.instance.get_permission_reference(
+        stack_head_witness.key(),
+        stack_head_witness.value(),
+        &stack_head_witness,
+    );
+}
+```
+Remember, to alter a `tracked` value, we need to be inside a `proof` block. From here, we may construct a `PPtr` that points to the address we just loaded, `top_address` and use the permission we just got from our TSM to read the top `StackCell`:
+```rust
+let permissioned_pointer = PPtr::<StackCell>::from_addr(top_address);
+let top_stack_cell = permissioned_pointer.read(Tracked(stack_cell_permission_reference));
+```
+
+So we've checked that the stack was not empty when we read the `top_address`, we used a witness token to gain a permission from the TSM for the `StackCell` that resides at `top_address` and then we used the permission to dereference `top_address` as a `StackCell`. Stop here and think for a minute - none of what we did had to be wrapped in an `unsafe` block. From here, we enter the main logic of a `pop`; the skeleton should not need explanation:
+
+```rust
+let new_stack_head_address_result = atomic_with_ghost!{
+    self.top_address => compare_exchange(
+        top_address,
+        top_stack_cell.next_address
+    );
+    update current_stack_head_address -> new_stack_head_address;
+    returning previous_head_address_result;
+
+    ghost atomic_tokens => {
+        if let Ok(_) = previous_head_address_result {
+           // TODO
+        }
+    }
+}
+```
+
+How do we need to update the state of our `AtomicUsize` if the `pop` is successful? Well, since we are allowing `StackCell`s to leak into the heap, we do not actually need to update the witnesses map. However, we do need to call our `pop` transition from our TSM to update the stack representation and set of popped cells. Naively, we might just try:
+
+```rust
+update current_stack_head_address -> new_stack_head_address;
+returning previous_head_address_result;
+
+ghost atomic_tokens => {
+    if let Ok(_) = previous_head_address_result {
+        self.instance.pop(
+            stack_head_witness.value(),
+            &mut atomic_tokens.current_stack_addresses,
+            &mut atomic_tokens.popped_addresses,
+            &stack_head_witness
+        );
+    }
+}
+```
+
+However this fails to verify for two separate reasons:
+ 1. Verus does not know that there is a witness token that exists for the `new_stack_head_address`
+ 2. Verus does not know that the witness token for `current_stack_head_address` has `next` address that equals to `new_stack_head_address`
