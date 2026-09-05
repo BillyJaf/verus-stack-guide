@@ -1170,6 +1170,109 @@ ghost atomic_tokens => {
 }
 ```
 
-However this fails to verify for two separate reasons:
- 1. Verus does not know that there is a witness token that exists for the `new_stack_head_address`
- 2. Verus does not know that the witness token for `current_stack_head_address` has `next` address that equals to `new_stack_head_address`
+However this fails to verify for a perculiar reason - Verus does not know that the `stack_head_witness` token is still included in the state of the `AtomicUsize`. Of course, we know this to be true (since we never remove witnesses), but along the way, Verus has lost this fact. We can use the property that we previously defined in our TSM `same_address_implies_same_permission` and pass it the token that we have, `stack_head_witness` and also a token from the `AtomicUsize` state:
+
+```rust
+let tracked equal_witness = *atomic_tokens.witnesses.tracked_borrow(current_stack_head_address);
+self.instance.same_address_implies_same_permission(
+    stack_head_witness.value(),
+    equal_witness.value(),
+    &stack_head_witness,
+    &equal_witness
+);
+```
+
+Apart from this, we need to assert some minor things that are trivial, but not useable facts without invoking them. And this is all we have to prove to Verus! Outside of this synchronisation, we can just return the popped element to the user if it was successful:
+
+```rust
+if let Ok(new_stack_head_address) = new_stack_head_address_result {
+    return Some(top_stack_cell.elem);
+}
+```
+
+Combining the above, the final `pop` looks like this:
+
+```rust
+pub fn pop(&self) -> (elem: Option<u32>)
+    requires
+        self.wf(),
+    ensures
+        self.wf(),
+{
+    loop
+        invariant
+            self.wf(),
+    {
+        let tracked stack_head_witness;
+        let tracked stack_cell_permission_reference;
+
+        let top_address =
+            atomic_with_ghost!{
+            self.top_address => load();
+            returning addr;
+
+            ghost atomic_tokens => {
+                stack_head_witness = *atomic_tokens.witnesses.tracked_borrow(addr);
+            }
+        };
+
+        if top_address == self.base_address {
+            return None;
+        }
+        proof {
+            stack_cell_permission_reference =
+            self.instance.get_permission_reference(
+                stack_head_witness.key(),
+                stack_head_witness.value(),
+                &stack_head_witness,
+            );
+        }
+
+        let permissioned_pointer = PPtr::<StackCell>::from_addr(top_address);
+        let top_stack_cell = permissioned_pointer.read(Tracked(stack_cell_permission_reference));
+
+        let new_stack_head_address_result =
+            atomic_with_ghost!{
+            self.top_address => compare_exchange(
+                top_address,
+                top_stack_cell.next_address
+            );
+            update current_stack_head_address -> new_stack_head_address;
+            returning previous_head_address_result;
+
+            ghost atomic_tokens => {
+                if let Ok(_) = previous_head_address_result {
+                    // Assert that the witness token is still in the map:
+                    let tracked equal_witness = *atomic_tokens.witnesses.tracked_borrow(current_stack_head_address);
+                    self.instance.same_address_implies_same_permission(
+                        stack_head_witness.value(),
+                        equal_witness.value(),
+                        &stack_head_witness,
+                        &equal_witness
+                    );
+
+                    // This assert is are trivial, but we need to disharge them:
+                    assert(atomic_tokens.current_stack_addresses.value() =~= atomic_tokens.current_stack_addresses.value().drop_last().push(current_stack_head_address));
+
+                    self.instance.pop(
+                        stack_head_witness.value(),
+                        &mut atomic_tokens.current_stack_addresses,
+                        &mut atomic_tokens.popped_addresses,
+                        &stack_head_witness
+                    );
+                }
+            }
+        };
+
+        if let Ok(new_stack_head_address) = new_stack_head_address_result {
+            return Some(top_stack_cell.elem);
+        }
+    }
+}
+```
+
+## Summary:
+
+Well, that guide was quite large, but it was hopfeully quite informing. To summarise the key points, instead of using raw-pointers (which are unsafe) we used permissioned pointers and stored these permissions in the tokenised state machine. This TSM had several fields that return tokens to the user when updated. These tokens represent our state, and we defined invariants on the tokens that were inline with our stack-properties. To relate these tokens to our physical stack, we store them in the associated state of the `AtomicUsize` and define similar invariants in the well-formedness condition. Whenever we update the `AtomicUsize`, we require the well-formedness condition to hold afterwards - we use the tokens generated by the TSM (which have their own invariants) to upkeep this well-formedness condition. 
+
+Essentially, the combination of the TSM and the `AtomicUsize` well-formedness condition are the guarantees we have about the system. They ensure that every update to the `AtomicUsize` is correct in the way that we defined.
