@@ -10,7 +10,7 @@ A Treiber Stack is a stack data structure that permits concurrency through atomi
 
 In a Treiber Stack, system wide progress is guaranteed; if a thread fails to make progress, it is the direct result of another thread making progress. This is a property that is not seen in Lock-Based algorithms if, for example, a thread is descheduled while holding a mutex. With the formalities out of the way, let's take a look at what operations are present in a Treiber Stack, and how we can implement & verify them!
 
-## Operations:
+## Operations
 
 The Treiber Stack at its core is still just a stack. As a result, the two main operations that we must support are `push` and `pop`. The stack is made using a linked-list structure where each element maintains a pointer to the one below it in the stack. The actual stack object that we will interact therefore only needs to hold the address of the top element in the stack, and we can `push` and `pop` by updating this top address. In this explanation, I will use the words 'top' & 'head' interchangeably, and also the words 'base' & 'bottom' interchangeably.
 
@@ -41,7 +41,7 @@ The following is an overview of how `pop` works:
  5. If the address has not changed, then no other thread has changed the stack - atomically set the stacks `top_address` to the address you previously obtained, `next_address`, and return the popped element `elem`.
  6. If the stack's `top_address` has changed, then another thread has changed the stack. Repeat from step 1.
 
-### The ABA Problem:
+## The ABA Problem
 
 Those with a keen eye might have noticed a problem with the above algorithm known as the [ABA problem](https://en.wikipedia.org/wiki/ABA_problem). The crux of the problem is as follows: we assume that the stack has not been interacted with by comparing addresses, but there is nothing stopping everything underneath this address from changing. To illustrate this point, consider the following stack:
 
@@ -71,9 +71,9 @@ So how can we solve this problem?
 
 The solution is actually somewhat trivial, but also undesireable from a performance perspective - we let `StackCell`s leak into the heap. If we never deallocate `StackCell`s, then we can never reuse their memory, and not run into this problem. Of course, as I mentioned, this is not desireable from a performance perspective - but this guide book is more focused on verification rather than performance!
 
-## Implementation:
+## Implementation
 
-### Tokenized State Machine Fields:
+### Tokenized State Machine Fields
 
 So let's have a go at an implementation and an explanation as to why tokenized state machines are perfect for this data structure. Firstly, looking at the above pseudo-code, you'll notice that we did something like this while popping elements:
 ```rust
@@ -321,7 +321,7 @@ tokenized_state_machine!{
 }
 ```
 
-### Tokenized State Machine Invariants:
+### Tokenized State Machine Invariants
 
 Now that we have our fields, let's have a go at writing some invariants that should hold throughout all transitions we write.
 
@@ -450,7 +450,7 @@ Recall that the goal of our invariants is to uphold the stack properties and to 
 
 And with that, we have all of the invariants that we need in our TSM - hopefully none of the stated invariants should come as a surprise to the reader.
 
-### Tokenized State Machine Transitions:
+### Tokenized State Machine Transitions
 
 Now that we have the invariants, we can write the transitions in our TSM. Starting off with the `init` initialiser that doesn't really need explanation:
 
@@ -505,7 +505,7 @@ Wow, it's even easier! Since we are allowing `PPtr<StackCell>`s to live permanen
 
 And those are all the transitions we need. We will need a handful of properties, but those will only make sense in the context of future problems we run into.
 
-#### Tokenized State Machine Purpose:
+#### Tokenized State Machine Purpose
 
 So what does the tokenised state machine actually buy us? Well, there are two key parts of the state machine that we have created; the `StackCell` permission storage, and the stack representation.
 
@@ -515,7 +515,7 @@ Second, regarding the stack representation `current_stack_addresses`, the TSM ho
 
 With all of this in mind, lets take a look at how we can relate these invariants and state to the implementation of a stack.
 
-### Well-Formedness:
+### Well-Formedness
 
 For the implementation, we already have the foundation of what we will use:
 
@@ -790,7 +790,7 @@ And that's most of what we need for the stack to be considered correct - remembe
 
 That is everything that we need for our stack to be well-formed. We have system-wide invariants from the TSM through the tokens, and a relation between these tokens and `top_address` through the `AtomicUsize`s stored state and well-formedness condition (provided that we assert this condition). Let's move on to the real stuff!
 
-### Construction:
+### Construction
 
 We haven't actually written a `push` or `pop` method yet, but we've done most of the heavy lifting in the proof already. Let's start by writing the method that constructs a new `TreiberStack`: we know that this method should not take any arguments and should return to us a fresh `TreiberStack` that is well formed:
 
@@ -878,7 +878,7 @@ Remember, we need the `base_address` and TSM `instance` as constants, so we pass
 
 And with that, we have arrived at where most of you likely thought we would start; writing `push` and `pop` operations.
 
-### Push:
+### Push
 
 Lets start with the basics. We know that we are pushing an element of some kind to the stack - we will be using a `u32`. We also know that `push` will loop forever until it is successful, but Verus won't allow us to loop without a `decreases` clause, so we'll have to include `#![cfg_attr(verus_keep_ghost, verifier::exec_allows_no_decreases_clause)]` at the top of our file. Trivially, we will have to construct a new `StackCell` and wrap it in a `PPtr` as well. Finally, we want the stack to be well-formed both when we start and finish:
 
@@ -1077,7 +1077,7 @@ pub fn push(&self, elem: u32)
 }
 ```
 
-### Pop:
+### Pop
 Our `pop` method has the same skeleton as `push`; we loop infinitely until we successfully pop an element:
 ```rust
 pub fn pop(&self) -> (elem: Option<u32>)
@@ -1271,8 +1271,10 @@ pub fn pop(&self) -> (elem: Option<u32>)
 }
 ```
 
-## Summary:
+## Summary
 
 Well, that guide was quite large, but it was hopfeully quite informing. To summarise the key points, instead of using raw-pointers (which are unsafe) we used permissioned pointers and stored these permissions in the tokenised state machine. This TSM had several fields that return tokens to the user when updated. These tokens represent our state, and we defined invariants on the tokens that were inline with our stack-properties. To relate these tokens to our physical stack, we store them in the associated state of the `AtomicUsize` and define similar invariants in the well-formedness condition. Whenever we update the `AtomicUsize`, we require the well-formedness condition to hold afterwards - we use the tokens generated by the TSM (which have their own invariants) to upkeep this well-formedness condition. 
 
 Essentially, the combination of the TSM and the `AtomicUsize` well-formedness condition are the guarantees we have about the system. They ensure that every update to the `AtomicUsize` is correct in the way that we defined.
+
+See [the full verified source](src-treiber-stack.md) for more details.

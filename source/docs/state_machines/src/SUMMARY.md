@@ -27,6 +27,10 @@
         - [Verified Source](./examples/src-rc.md)
         - [Exercises](./examples/rc-exercises.md)
 
+      - [Treiber Stack](./examples/treiber-stack.md)
+        - [Unverified Source](./examples/rust-treiber-stack.md)
+        - [Verified Source](./examples/src-treiber-stack.md)
+
     - [Guide (TODO)](tutorial-again.md)
       - [Counting to _n_ (again) (TODO)](./examples/counting-to-n-again.md)
       - [Hash table (TODO)](./examples/hash-table.md)
